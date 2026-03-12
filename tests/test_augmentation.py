@@ -34,12 +34,14 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
             gt=gt,
             current_index=current_index,
             lateral_offset_m=offset_m,
+            heading_offset_rad=0.0,
             recover_time_s=1.5,
         )
         bidirectional_result = augment_trajectory_bidirectional(
             gt=gt,
             current_index=current_index,
             lateral_offset_m=offset_m,
+            heading_offset_rad=0.0,
             future_recover_time_s=1.5,
             past_connect_time_s=1.0,
             pattern_name=pattern_name,
@@ -145,6 +147,7 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
             gt=gt,
             current_index=current_index,
             lateral_offset_m=-3.0,
+            heading_offset_rad=0.0,
             future_recover_time_s=1.5,
             past_connect_time_s=1.0,
             pattern_name="curve_decelerating",
@@ -165,6 +168,7 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
             gt=gt,
             current_index=current_index,
             lateral_offset_m=3.0,
+            heading_offset_rad=0.0,
             future_recover_time_s=0.5,
             past_connect_time_s=0.5,
             pattern_name="curve_decelerating",
@@ -175,6 +179,25 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
 
         self.assertLess(float(np.max(np.abs(augmented_arc_speed - gt_arc_speed))), 5.0e-3)
         self.assertGreater(float(np.max(np.abs(augmented_chord_speed - gt_chord_speed))), 0.3)
+
+    def test_heading_offset_is_reflected_at_current_pose(self) -> None:
+        gt, current_index = load_test_pattern("straight_constant", DEFAULT_PATTERN_DIR)
+        for yaw_offset_deg in (-10.0, 10.0):
+            with self.subTest(yaw_offset_deg=yaw_offset_deg):
+                result = augment_trajectory_bidirectional(
+                    gt=gt,
+                    current_index=current_index,
+                    lateral_offset_m=1.0,
+                    heading_offset_rad=np.deg2rad(yaw_offset_deg),
+                    future_recover_time_s=1.5,
+                    past_connect_time_s=1.0,
+                    pattern_name="straight_constant",
+                )
+                self.assertAlmostEqual(
+                    float(np.degrees(result.augmented_full.yaw[current_index])),
+                    yaw_offset_deg,
+                    delta=1.0,
+                )
 
 
 if __name__ == "__main__":

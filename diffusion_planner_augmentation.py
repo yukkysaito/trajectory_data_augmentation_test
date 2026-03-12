@@ -73,6 +73,7 @@ class SegmentAugmentationResult:
     connect_distance_budget_m: float
     connect_speed_scale: float
     lateral_offset_m: float
+    heading_offset_rad: float
 
 
 @dataclass
@@ -92,6 +93,7 @@ class BidirectionalAugmentationResult:
     window_start_index: int
     window_end_index: int
     lateral_offset_m: float
+    heading_offset_rad: float
     past_connect_time_s: float
     future_recover_time_s: float
 
@@ -374,16 +376,64 @@ def quintic_decay(unit_s: np.ndarray) -> np.ndarray:
     return 1.0 - 10.0 * u**3 + 15.0 * u**4 - 6.0 * u**5
 
 
-def lateral_offset_profile(s: np.ndarray, s_merge: float, lateral_offset_m: float) -> np.ndarray:
+def solve_lateral_profile_coeffs(
+    s_merge: float,
+    lateral_offset_m: float,
+    heading_offset_rad: float,
+) -> np.ndarray:
     if s_merge <= 0.0:
         raise ValueError("s_merge must be positive.")
-    return lateral_offset_m * quintic_decay(s / s_merge)
+
+    # Use a quintic profile in arc length so the path can satisfy:
+    # l(0), l'(0), l''(0), l(L), l'(L), l''(L).
+    #
+    # l'(0) controls the initial heading error. For small offsets on a smooth
+    # centerline, heading error is approximately atan(l'(0)).
+    L = float(s_merge)
+    a0 = float(lateral_offset_m)
+    a1 = float(np.tan(heading_offset_rad))
+    a2 = 0.0
+
+    system = np.array(
+        [
+            [L**3, L**4, L**5],
+            [3.0 * L**2, 4.0 * L**3, 5.0 * L**4],
+            [6.0 * L, 12.0 * L**2, 20.0 * L**3],
+        ],
+        dtype=float,
+    )
+    rhs = np.array(
+        [
+            -(a0 + a1 * L + a2 * L**2),
+            -(a1 + 2.0 * a2 * L),
+            -(2.0 * a2),
+        ],
+        dtype=float,
+    )
+    a3, a4, a5 = np.linalg.solve(system, rhs)
+    return np.array([a0, a1, a2, a3, a4, a5], dtype=float)
+
+
+def lateral_offset_profile(
+    s: np.ndarray,
+    s_merge: float,
+    lateral_offset_m: float,
+    heading_offset_rad: float = 0.0,
+) -> np.ndarray:
+    coeffs = solve_lateral_profile_coeffs(
+        s_merge=s_merge,
+        lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
+    )
+    powers = np.stack([s**idx for idx in range(6)], axis=-1)
+    return powers @ coeffs
 
 
 def build_merge_path(
     centerline: Centerline,
     s_merge: float,
     lateral_offset_m: float,
+    heading_offset_rad: float = 0.0,
     dense_ds: float = 0.05,
 ) -> DensePath:
     if s_merge <= 0.0:
@@ -394,7 +444,12 @@ def build_merge_path(
         s_segment = np.append(s_segment, s_merge)
 
     base_x, base_y, base_yaw = sample_centerline(centerline, s_segment)
-    offset = lateral_offset_profile(s_segment, s_merge, lateral_offset_m)
+    offset = lateral_offset_profile(
+        s_segment,
+        s_merge,
+        lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
+    )
     normal_x = -np.sin(base_yaw)
     normal_y = np.cos(base_yaw)
 
@@ -409,18 +464,31 @@ def solve_merge_centerline_s(
     centerline: Centerline,
     distance_budget_m: float,
     lateral_offset_m: float,
+    heading_offset_rad: float = 0.0,
     dense_ds: float = 0.05,
     tol_m: float = 1.0e-3,
 ) -> tuple[float, DensePath]:
-    if abs(lateral_offset_m) < 1.0e-9:
-        merge_path = build_merge_path(centerline, distance_budget_m, lateral_offset_m, dense_ds=dense_ds)
+    if abs(lateral_offset_m) < 1.0e-9 and abs(heading_offset_rad) < 1.0e-9:
+        merge_path = build_merge_path(
+            centerline,
+            distance_budget_m,
+            lateral_offset_m,
+            heading_offset_rad=heading_offset_rad,
+            dense_ds=dense_ds,
+        )
         return distance_budget_m, merge_path
 
     upper = min(distance_budget_m, centerline.s[-1])
     lower = min(max(dense_ds, abs(lateral_offset_m) * 0.25), upper * 0.5)
 
     def length_for(s_merge: float) -> float:
-        return build_merge_path(centerline, s_merge, lateral_offset_m, dense_ds=dense_ds).sigma[-1]
+        return build_merge_path(
+            centerline,
+            s_merge,
+            lateral_offset_m,
+            heading_offset_rad=heading_offset_rad,
+            dense_ds=dense_ds,
+        ).sigma[-1]
 
     while lower > dense_ds * 1.0e-3 and length_for(lower) >= distance_budget_m:
         lower *= 0.5
@@ -438,7 +506,13 @@ def solve_merge_centerline_s(
             break
 
     s_merge = 0.5 * (lower + upper)
-    merge_path = build_merge_path(centerline, s_merge, lateral_offset_m, dense_ds=dense_ds)
+    merge_path = build_merge_path(
+        centerline,
+        s_merge,
+        lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
+        dense_ds=dense_ds,
+    )
     return s_merge, merge_path
 
 
@@ -446,12 +520,14 @@ def plan_recovery_path(
     centerline: Centerline,
     distance_budget_m: float,
     lateral_offset_m: float,
+    heading_offset_rad: float = 0.0,
     dense_ds: float = 0.05,
 ) -> tuple[float, DensePath, float]:
     candidate_path = build_merge_path(
         centerline=centerline,
         s_merge=distance_budget_m,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
         dense_ds=dense_ds,
     )
     candidate_length = candidate_path.sigma[-1]
@@ -463,6 +539,7 @@ def plan_recovery_path(
         centerline=centerline,
         distance_budget_m=distance_budget_m,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
         dense_ds=dense_ds,
     )
     return s_merge, merge_path, 1.0
@@ -514,6 +591,7 @@ def extract_reversed_past_segment(gt: Trajectory2D, current_index: int) -> Traje
 def augment_directed_segment(
     segment: Trajectory2D,
     lateral_offset_m: float,
+    heading_offset_rad: float,
     connect_time_s: float,
     dense_ds: float = 0.05,
 ) -> SegmentAugmentationResult:
@@ -529,6 +607,7 @@ def augment_directed_segment(
         centerline=centerline,
         distance_budget_m=connect_budget_m,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
         dense_ds=dense_ds,
     )
 
@@ -580,6 +659,7 @@ def augment_directed_segment(
         connect_distance_budget_m=connect_budget_m,
         connect_speed_scale=connect_speed_scale,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
     )
 
 
@@ -587,6 +667,7 @@ def augment_future_trajectory(
     gt: Trajectory2D,
     current_index: int,
     lateral_offset_m: float,
+    heading_offset_rad: float,
     recover_time_s: float,
     dense_ds: float = 0.05,
 ) -> SegmentAugmentationResult:
@@ -594,6 +675,7 @@ def augment_future_trajectory(
     return augment_directed_segment(
         segment=future_segment,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
         connect_time_s=recover_time_s,
         dense_ds=dense_ds,
     )
@@ -616,6 +698,7 @@ def augment_trajectory_bidirectional(
     gt: Trajectory2D,
     current_index: int,
     lateral_offset_m: float,
+    heading_offset_rad: float,
     future_recover_time_s: float,
     past_connect_time_s: float,
     dense_ds: float = 0.05,
@@ -629,12 +712,14 @@ def augment_trajectory_bidirectional(
     future_result = augment_directed_segment(
         segment=future_segment,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
         connect_time_s=future_recover_time_s,
         dense_ds=dense_ds,
     )
     past_result = augment_directed_segment(
         segment=past_reverse_segment,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=-heading_offset_rad,
         connect_time_s=past_connect_time_s,
         dense_ds=dense_ds,
     )
@@ -690,6 +775,7 @@ def augment_trajectory_bidirectional(
         window_start_index=window_start_index,
         window_end_index=window_end_index,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
         past_connect_time_s=past_connect_time_s,
         future_recover_time_s=future_recover_time_s,
     )
@@ -713,6 +799,12 @@ def format_offset_suffix(value_m: float) -> str:
     sign = "p" if value_m >= 0.0 else "m"
     magnitude = f"{abs(value_m):.1f}".replace(".", "p")
     return f"_offset{sign}{magnitude}m"
+
+
+def format_yaw_suffix(value_deg: float) -> str:
+    sign = "p" if value_deg >= 0.0 else "m"
+    magnitude = f"{abs(value_deg):.0f}"
+    return f"_yaw{sign}{magnitude}deg"
 
 
 def exact_arc_speed_in_window(result: BidirectionalAugmentationResult) -> tuple[np.ndarray, np.ndarray]:
@@ -846,6 +938,7 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
         (
             f"pattern={result.pattern_name}, "
             f"offset={result.lateral_offset_m:+.2f} m, "
+            f"yaw={np.degrees(result.heading_offset_rad):+.0f} deg, "
             f"M={result.past_connect_time_s:.1f} s, "
             f"N={result.future_recover_time_s:.1f} s, "
             f"end_delta@8s={end_delta:.3f} m"
@@ -863,6 +956,7 @@ def run_demo(
     seed: int,
     output_path: Path,
     offset_m: float | None,
+    yaw_offset_deg: float,
     recover_time_s: float,
     past_connect_time_s: float,
 ) -> BidirectionalAugmentationResult:
@@ -873,6 +967,7 @@ def run_demo(
         gt=gt,
         current_index=current_index,
         lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=np.deg2rad(yaw_offset_deg),
         future_recover_time_s=recover_time_s,
         past_connect_time_s=past_connect_time_s,
         output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
@@ -888,6 +983,7 @@ def run_sweep(
     pattern_dir: Path,
     output_prefix: Path,
     offsets: list[float],
+    yaw_offsets_deg: list[float],
     recover_times: list[float],
     past_connect_times: list[float],
 ) -> list[Path]:
@@ -897,26 +993,29 @@ def run_sweep(
 
     for past_connect_time_s in past_connect_times:
         for offset in offsets:
-            for recover_time in recover_times:
-                result = augment_trajectory_bidirectional(
-                    gt=gt,
-                    current_index=current_index,
-                    lateral_offset_m=offset,
-                    future_recover_time_s=recover_time,
-                    past_connect_time_s=past_connect_time_s,
-                    output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
-                    output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
-                    pattern_name=pattern_name,
-                )
-                suffix = (
-                    pattern_suffix
-                    + format_offset_suffix(offset)
-                    + format_time_suffix("N", recover_time)
-                    + format_time_suffix("M", past_connect_time_s)
-                )
-                output_path = output_prefix.with_name(f"{output_prefix.name}{suffix}.png")
-                make_demo_figure(result, output_path=output_path)
-                output_paths.append(output_path)
+            for yaw_offset_deg in yaw_offsets_deg:
+                for recover_time in recover_times:
+                    result = augment_trajectory_bidirectional(
+                        gt=gt,
+                        current_index=current_index,
+                        lateral_offset_m=offset,
+                        heading_offset_rad=np.deg2rad(yaw_offset_deg),
+                        future_recover_time_s=recover_time,
+                        past_connect_time_s=past_connect_time_s,
+                        output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
+                        output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
+                        pattern_name=pattern_name,
+                    )
+                    suffix = (
+                        pattern_suffix
+                        + format_offset_suffix(offset)
+                        + format_yaw_suffix(yaw_offset_deg)
+                        + format_time_suffix("N", recover_time)
+                        + format_time_suffix("M", past_connect_time_s)
+                    )
+                    output_path = output_prefix.with_name(f"{output_prefix.name}{suffix}.png")
+                    make_demo_figure(result, output_path=output_path)
+                    output_paths.append(output_path)
 
     return output_paths
 
@@ -929,6 +1028,7 @@ def main() -> None:
     parser.add_argument("--recover-time", type=float, default=1.5)
     parser.add_argument("--past-connect-time", type=float, default=1.0)
     parser.add_argument("--offset", type=float, default=None)
+    parser.add_argument("--yaw-offset-deg", type=float, default=0.0)
     parser.add_argument("--write-pattern-csvs", action="store_true", help="Generate the CSV test patterns and exit.")
     parser.add_argument("--list-patterns", action="store_true", help="List available pattern names and exit.")
     parser.add_argument(
@@ -958,6 +1058,7 @@ def main() -> None:
 
     if args.sweep:
         offsets = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
+        yaw_offsets_deg = [-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0]
         recover_times = [0.5, 1.0, 1.5, 2.0]
         past_connect_times = [0.5, 1.0, 1.5, 2.0]
         output_paths = run_sweep(
@@ -965,6 +1066,7 @@ def main() -> None:
             pattern_dir=args.pattern_dir,
             output_prefix=args.output_prefix,
             offsets=offsets,
+            yaw_offsets_deg=yaw_offsets_deg,
             recover_times=recover_times,
             past_connect_times=past_connect_times,
         )
@@ -980,6 +1082,7 @@ def main() -> None:
         seed=args.seed,
         output_path=args.output,
         offset_m=args.offset,
+        yaw_offset_deg=args.yaw_offset_deg,
         recover_time_s=args.recover_time,
         past_connect_time_s=args.past_connect_time,
     )
@@ -1012,6 +1115,7 @@ def main() -> None:
         f"augmented output window: past {OUTPUT_PAST_HORIZON_S:.1f}s / future {OUTPUT_FUTURE_HORIZON_S:.1f}s"
     )
     print(f"Lateral offset: {result.lateral_offset_m:+.3f} m")
+    print(f"Heading offset: {np.degrees(result.heading_offset_rad):+.1f} deg")
     print(f"Past bridge M: {result.past_connect_time_s:.2f} s")
     print(f"Future bridge N: {result.future_recover_time_s:.2f} s")
     print(f"Past speed scale: {result.past_segment.connect_speed_scale:.3f}")
