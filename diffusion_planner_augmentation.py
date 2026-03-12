@@ -98,6 +98,24 @@ class BidirectionalAugmentationResult:
     future_recover_time_s: float
 
 
+@dataclass
+class LateralAccelDiagnostics:
+    limit_mps2: float
+    time: np.ndarray
+    gt_lateral_accel_mps2: np.ndarray
+    augmented_lateral_accel_mps2: np.ndarray
+    max_abs_augmented_lateral_accel_mps2: float
+    passes: bool
+
+
+@dataclass
+class FeasibilitySearchDiagnostics:
+    initial: LateralAccelDiagnostics
+    adapted_result: BidirectionalAugmentationResult | None
+    adapted: LateralAccelDiagnostics | None
+    adaptation_strategy: str | None
+
+
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
@@ -831,6 +849,135 @@ def exact_arc_speed_in_window(result: BidirectionalAugmentationResult) -> tuple[
     return gt_full_speed[window_slice], aug_full_speed[window_slice]
 
 
+def lateral_acceleration_from_speed_and_curvature(
+    speed_mps: np.ndarray,
+    curvature_inv_m: np.ndarray,
+) -> np.ndarray:
+    return speed_mps * speed_mps * curvature_inv_m
+
+
+def evaluate_lateral_accel_in_window(
+    result: BidirectionalAugmentationResult,
+    limit_mps2: float,
+) -> LateralAccelDiagnostics:
+    gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
+    gt_curvature = curvature_from_xy(
+        result.original_window.x,
+        result.original_window.y,
+        cumulative_distance(result.original_window.x, result.original_window.y),
+    )
+    augmented_curvature = curvature_from_xy(
+        result.augmented_window.x,
+        result.augmented_window.y,
+        cumulative_distance(result.augmented_window.x, result.augmented_window.y),
+    )
+
+    gt_lateral_accel = lateral_acceleration_from_speed_and_curvature(gt_arc_speed, gt_curvature)
+    augmented_lateral_accel = lateral_acceleration_from_speed_and_curvature(
+        augmented_arc_speed,
+        augmented_curvature,
+    )
+    max_abs_augmented_lateral_accel = float(np.max(np.abs(augmented_lateral_accel)))
+
+    return LateralAccelDiagnostics(
+        limit_mps2=float(limit_mps2),
+        time=result.original_window.t.copy(),
+        gt_lateral_accel_mps2=gt_lateral_accel,
+        augmented_lateral_accel_mps2=augmented_lateral_accel,
+        max_abs_augmented_lateral_accel_mps2=max_abs_augmented_lateral_accel,
+        passes=max_abs_augmented_lateral_accel <= float(limit_mps2) + 1.0e-9,
+    )
+
+
+def generate_time_candidates(
+    start_s: float,
+    end_s: float,
+    step_s: float = DEFAULT_DT,
+) -> list[float]:
+    start_tick = int(np.ceil((start_s - 1.0e-9) / step_s))
+    end_tick = int(np.floor((end_s + 1.0e-9) / step_s))
+    return [tick * step_s for tick in range(start_tick, end_tick + 1)]
+
+
+def search_lateral_accel_feasible_result(
+    initial_result: BidirectionalAugmentationResult,
+    max_lateral_accel_mps2: float,
+    search_step_s: float = DEFAULT_DT,
+    max_future_recover_time_s: float = FULL_FUTURE_HORIZON_S,
+    max_past_connect_time_s: float = FULL_PAST_HORIZON_S,
+) -> FeasibilitySearchDiagnostics:
+    initial = evaluate_lateral_accel_in_window(initial_result, max_lateral_accel_mps2)
+    if initial.passes:
+        return FeasibilitySearchDiagnostics(
+            initial=initial,
+            adapted_result=None,
+            adapted=None,
+            adaptation_strategy=None,
+        )
+
+    def build_candidate(recover_time_s: float, past_connect_time_s: float) -> BidirectionalAugmentationResult:
+        return augment_trajectory_bidirectional(
+            gt=initial_result.original_full,
+            current_index=initial_result.current_index,
+            lateral_offset_m=initial_result.lateral_offset_m,
+            heading_offset_rad=initial_result.heading_offset_rad,
+            future_recover_time_s=recover_time_s,
+            past_connect_time_s=past_connect_time_s,
+            output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
+            output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
+            pattern_name=initial_result.pattern_name,
+        )
+
+    initial_n = initial_result.future_recover_time_s
+    initial_m = initial_result.past_connect_time_s
+
+    future_candidates = generate_time_candidates(
+        start_s=initial_n + search_step_s,
+        end_s=max_future_recover_time_s,
+        step_s=search_step_s,
+    )
+    for candidate_n in future_candidates:
+        candidate_result = build_candidate(candidate_n, initial_m)
+        candidate_diag = evaluate_lateral_accel_in_window(candidate_result, max_lateral_accel_mps2)
+        if candidate_diag.passes:
+            return FeasibilitySearchDiagnostics(
+                initial=initial,
+                adapted_result=candidate_result,
+                adapted=candidate_diag,
+                adaptation_strategy="extend N",
+            )
+
+    past_candidates = generate_time_candidates(
+        start_s=initial_m + search_step_s,
+        end_s=max_past_connect_time_s,
+        step_s=search_step_s,
+    )
+    future_with_past_candidates = generate_time_candidates(
+        start_s=initial_n,
+        end_s=max_future_recover_time_s,
+        step_s=search_step_s,
+    )
+    for candidate_m in past_candidates:
+        for candidate_n in future_with_past_candidates:
+            candidate_result = build_candidate(candidate_n, candidate_m)
+            candidate_diag = evaluate_lateral_accel_in_window(candidate_result, max_lateral_accel_mps2)
+            if candidate_diag.passes:
+                strategy = "extend M" if np.isclose(candidate_n, initial_n) else "extend M and N"
+                return FeasibilitySearchDiagnostics(
+                    initial=initial,
+                    adapted_result=candidate_result,
+                    adapted=candidate_diag,
+                    adaptation_strategy=strategy,
+                )
+
+    return FeasibilitySearchDiagnostics(
+        initial=initial,
+        adapted_result=None,
+        adapted=None,
+        adaptation_strategy=None,
+    )
+
+
 def plot_pose_triangles(
     ax: plt.Axes,
     x: np.ndarray,
@@ -854,7 +1001,11 @@ def plot_pose_triangles(
         )
 
 
-def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path) -> None:
+def make_demo_figure(
+    result: BidirectionalAugmentationResult,
+    output_path: Path,
+    feasibility: FeasibilitySearchDiagnostics | None = None,
+) -> None:
     gt_full = result.original_full
     gt = result.original_window
     augmented = result.augmented_window
@@ -878,12 +1029,34 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
         np.array([result.past_segment.merge_centerline_s]),
     )
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    adapted_result = feasibility.adapted_result if feasibility is not None else None
+    adapted = adapted_result.augmented_window if adapted_result is not None else None
+    adapted_arc_speed = None
+    adapted_curvature = None
+    if adapted_result is not None:
+        _, adapted_arc_speed = exact_arc_speed_in_window(adapted_result)
+        adapted_curvature = curvature_from_xy(
+            adapted.x,
+            adapted.y,
+            cumulative_distance(adapted.x, adapted.y),
+        )
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
+    axes = axes.reshape(-1)
 
     axes[0].plot(gt_full.x, gt_full.y, color="0.88", lw=1.5, label="GT full context")
     axes[0].plot(gt.x, gt.y, color="0.55", lw=2.0, label="GT window")
     axes[0].plot(augmented.x[: current_index_in_window + 1], augmented.y[: current_index_in_window + 1], color="#2ca02c", lw=2.5, label="Augmented past")
     axes[0].plot(augmented.x[current_index_in_window:], augmented.y[current_index_in_window:], color="#ff7f0e", lw=2.5, label="Augmented future")
+    if adapted is not None:
+        axes[0].plot(
+            adapted.x,
+            adapted.y,
+            color="#1f77b4",
+            lw=2.0,
+            ls="-.",
+            label="Lowest pass candidate",
+        )
     plot_pose_triangles(axes[0], gt.x, gt.y, gt.yaw, color="0.45", size=34, alpha=0.65, zorder=2.5)
     plot_pose_triangles(
         axes[0],
@@ -909,6 +1082,15 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
     axes[1].plot(gt.t, gt_chord_speed, color="0.55", lw=1.7, ls="--", label="GT chord")
     axes[1].plot(augmented.t, augmented_arc_speed, color="#ff7f0e", lw=2.0, label="Aug exact arc")
     axes[1].plot(augmented.t, augmented_chord_speed, color="#d95f02", lw=1.7, ls="--", label="Aug chord")
+    if adapted is not None and adapted_arc_speed is not None:
+        axes[1].plot(
+            adapted.t,
+            adapted_arc_speed,
+            color="#1f77b4",
+            lw=1.9,
+            ls="-.",
+            label="Pass candidate exact arc",
+        )
     axes[1].axvline(-result.past_connect_time_s, color="#1f77b4", ls="--", lw=1.2)
     axes[1].axvline(0.0, color="0.35", ls=":", lw=1.2)
     axes[1].axvline(result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
@@ -921,6 +1103,15 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
 
     axes[2].plot(gt.t, gt_curvature, color="0.55", lw=2.0, label="GT window")
     axes[2].plot(augmented.t, augmented_curvature, color="#ff7f0e", lw=2.0, label="Augmented window")
+    if adapted is not None and adapted_curvature is not None:
+        axes[2].plot(
+            adapted.t,
+            adapted_curvature,
+            color="#1f77b4",
+            lw=1.9,
+            ls="-.",
+            label="Pass candidate",
+        )
     axes[2].axvline(-result.past_connect_time_s, color="#1f77b4", ls="--", lw=1.2)
     axes[2].axvline(0.0, color="0.35", ls=":", lw=1.2)
     axes[2].axvline(result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
@@ -931,21 +1122,113 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
     axes[2].grid(True, alpha=0.25)
     axes[2].legend(loc="best")
 
+    if feasibility is not None:
+        initial_diag = feasibility.initial
+        axes[3].plot(
+            initial_diag.time,
+            initial_diag.gt_lateral_accel_mps2,
+            color="0.55",
+            lw=2.0,
+            label="GT",
+        )
+        axes[3].plot(
+            initial_diag.time,
+            initial_diag.augmented_lateral_accel_mps2,
+            color="#ff7f0e",
+            lw=2.0,
+            label="Requested augmentation",
+        )
+        violation_mask = np.abs(initial_diag.augmented_lateral_accel_mps2) > initial_diag.limit_mps2 + 1.0e-9
+        if np.any(violation_mask):
+            axes[3].scatter(
+                initial_diag.time[violation_mask],
+                initial_diag.augmented_lateral_accel_mps2[violation_mask],
+                color="#d62728",
+                s=26,
+                zorder=3.0,
+                label="Limit exceeded",
+            )
+        if feasibility.adapted is not None:
+            axes[3].plot(
+                feasibility.adapted.time,
+                feasibility.adapted.augmented_lateral_accel_mps2,
+                color="#1f77b4",
+                lw=1.9,
+                ls="-.",
+                label="Lowest pass candidate",
+            )
+        axes[3].axhline(initial_diag.limit_mps2, color="#d62728", ls="--", lw=1.2)
+        axes[3].axhline(-initial_diag.limit_mps2, color="#d62728", ls="--", lw=1.2)
+        axes[3].axvline(0.0, color="0.35", ls=":", lw=1.2)
+        axes[3].set_xlim(initial_diag.time[0], initial_diag.time[-1])
+        axes[3].set_title("Lateral Acceleration")
+        axes[3].set_xlabel("time [s]")
+        axes[3].set_ylabel("a_lat [m/s^2]")
+        axes[3].grid(True, alpha=0.25)
+        axes[3].legend(loc="best")
+
+        status_lines = [
+            f"limit={initial_diag.limit_mps2:.2f} m/s^2",
+            (
+                f"requested: {'PASS' if initial_diag.passes else 'FAIL'} "
+                f"(max={initial_diag.max_abs_augmented_lateral_accel_mps2:.2f})"
+            ),
+        ]
+        if feasibility.adapted_result is not None and feasibility.adapted is not None:
+            status_lines.append(
+                (
+                    f"{feasibility.adaptation_strategy}: "
+                    f"M={feasibility.adapted_result.past_connect_time_s:.1f}s, "
+                    f"N={feasibility.adapted_result.future_recover_time_s:.1f}s "
+                    f"(max={feasibility.adapted.max_abs_augmented_lateral_accel_mps2:.2f})"
+                )
+            )
+        elif feasibility.adaptation_strategy == "search disabled":
+            status_lines.append("adaptive search disabled")
+        elif not initial_diag.passes:
+            status_lines.append("no feasible candidate found within search range")
+
+        axes[3].text(
+            0.02,
+            0.98,
+            "\n".join(status_lines),
+            transform=axes[3].transAxes,
+            va="top",
+            ha="left",
+            fontsize=9.5,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88, "edgecolor": "0.8"},
+        )
+    else:
+        axes[3].axis("off")
+
     end_delta = np.linalg.norm(
         np.array([augmented.x[-1] - gt.x[-1], augmented.y[-1] - gt.y[-1]])
     )
+    title_parts = [
+        f"pattern={result.pattern_name}",
+        f"offset={result.lateral_offset_m:+.2f} m",
+        f"yaw={np.degrees(result.heading_offset_rad):+.0f} deg",
+        f"M={result.past_connect_time_s:.1f} s",
+        f"N={result.future_recover_time_s:.1f} s",
+        f"end_delta@8s={end_delta:.3f} m",
+    ]
+    if feasibility is not None and not feasibility.initial.passes:
+        if feasibility.adapted_result is not None:
+            title_parts.append(
+                (
+                    f"{feasibility.adaptation_strategy}: "
+                    f"M*={feasibility.adapted_result.past_connect_time_s:.1f} s, "
+                    f"N*={feasibility.adapted_result.future_recover_time_s:.1f} s"
+                )
+            )
+        elif feasibility.adaptation_strategy == "search disabled":
+            title_parts.append("lat-accel: adaptive search disabled")
+        else:
+            title_parts.append("lat-accel: no feasible candidate in search range")
     fig.suptitle(
-        (
-            f"pattern={result.pattern_name}, "
-            f"offset={result.lateral_offset_m:+.2f} m, "
-            f"yaw={np.degrees(result.heading_offset_rad):+.0f} deg, "
-            f"M={result.past_connect_time_s:.1f} s, "
-            f"N={result.future_recover_time_s:.1f} s, "
-            f"end_delta@8s={end_delta:.3f} m"
-        ),
+        ", ".join(title_parts),
         fontsize=12,
     )
-    fig.tight_layout()
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
 
@@ -959,7 +1242,9 @@ def run_demo(
     yaw_offset_deg: float,
     recover_time_s: float,
     past_connect_time_s: float,
-) -> BidirectionalAugmentationResult:
+    max_lateral_accel_mps2: float,
+    adaptive_bridge_search: bool,
+) -> tuple[BidirectionalAugmentationResult, FeasibilitySearchDiagnostics]:
     gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
     rng = np.random.default_rng(seed)
     lateral_offset_m = offset_m if offset_m is not None else sample_random_lateral_offset(rng)
@@ -974,8 +1259,19 @@ def run_demo(
         output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
         pattern_name=pattern_name,
     )
-    make_demo_figure(result, output_path=output_path)
-    return result
+    feasibility = search_lateral_accel_feasible_result(
+        initial_result=result,
+        max_lateral_accel_mps2=max_lateral_accel_mps2,
+    )
+    if not adaptive_bridge_search:
+        feasibility = FeasibilitySearchDiagnostics(
+            initial=feasibility.initial,
+            adapted_result=None,
+            adapted=None,
+            adaptation_strategy="search disabled",
+        )
+    make_demo_figure(result, output_path=output_path, feasibility=feasibility)
+    return result, feasibility
 
 
 def run_sweep(
@@ -986,6 +1282,8 @@ def run_sweep(
     yaw_offsets_deg: list[float],
     recover_times: list[float],
     past_connect_times: list[float],
+    max_lateral_accel_mps2: float,
+    adaptive_bridge_search: bool,
 ) -> list[Path]:
     gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
     output_paths: list[Path] = []
@@ -1006,6 +1304,17 @@ def run_sweep(
                         output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
                         pattern_name=pattern_name,
                     )
+                    feasibility = search_lateral_accel_feasible_result(
+                        initial_result=result,
+                        max_lateral_accel_mps2=max_lateral_accel_mps2,
+                    )
+                    if not adaptive_bridge_search:
+                        feasibility = FeasibilitySearchDiagnostics(
+                            initial=feasibility.initial,
+                            adapted_result=None,
+                            adapted=None,
+                            adaptation_strategy="search disabled",
+                        )
                     suffix = (
                         pattern_suffix
                         + format_offset_suffix(offset)
@@ -1014,7 +1323,7 @@ def run_sweep(
                         + format_time_suffix("M", past_connect_time_s)
                     )
                     output_path = output_prefix.with_name(f"{output_prefix.name}{suffix}.png")
-                    make_demo_figure(result, output_path=output_path)
+                    make_demo_figure(result, output_path=output_path, feasibility=feasibility)
                     output_paths.append(output_path)
 
     return output_paths
@@ -1029,6 +1338,17 @@ def main() -> None:
     parser.add_argument("--past-connect-time", type=float, default=1.0)
     parser.add_argument("--offset", type=float, default=None)
     parser.add_argument("--yaw-offset-deg", type=float, default=0.0)
+    parser.add_argument(
+        "--max-lateral-accel",
+        type=float,
+        default=3.0,
+        help="Absolute lateral acceleration limit [m/s^2] used for diagnostics and adaptive bridge search.",
+    )
+    parser.add_argument(
+        "--disable-adaptive-bridge-search",
+        action="store_true",
+        help="Only diagnose lateral-acceleration limit violations without searching for a feasible M/N pair.",
+    )
     parser.add_argument("--write-pattern-csvs", action="store_true", help="Generate the CSV test patterns and exit.")
     parser.add_argument("--list-patterns", action="store_true", help="List available pattern names and exit.")
     parser.add_argument(
@@ -1069,6 +1389,8 @@ def main() -> None:
             yaw_offsets_deg=yaw_offsets_deg,
             recover_times=recover_times,
             past_connect_times=past_connect_times,
+            max_lateral_accel_mps2=args.max_lateral_accel,
+            adaptive_bridge_search=not args.disable_adaptive_bridge_search,
         )
         print(f"Saved {len(output_paths)} sweep images for pattern: {args.pattern}")
         if output_paths:
@@ -1076,7 +1398,7 @@ def main() -> None:
             print(f"Last image: {output_paths[-1]}")
         return
 
-    result = run_demo(
+    result, feasibility = run_demo(
         pattern_name=args.pattern,
         pattern_dir=args.pattern_dir,
         seed=args.seed,
@@ -1085,6 +1407,8 @@ def main() -> None:
         yaw_offset_deg=args.yaw_offset_deg,
         recover_time_s=args.recover_time,
         past_connect_time_s=args.past_connect_time,
+        max_lateral_accel_mps2=args.max_lateral_accel,
+        adaptive_bridge_search=not args.disable_adaptive_bridge_search,
     )
 
     gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
@@ -1122,6 +1446,23 @@ def main() -> None:
     print(f"Future speed scale: {result.future_segment.connect_speed_scale:.3f}")
     print(f"Max exact-arc speed abs diff vs GT in output window: {arc_speed_abs_diff:.3f} m/s")
     print(f"Max chord-speed abs diff vs GT in output window: {chord_speed_abs_diff:.3f} m/s")
+    print(
+        f"Max |lateral acceleration| in output window: "
+        f"{feasibility.initial.max_abs_augmented_lateral_accel_mps2:.3f} m/s^2 "
+        f"(limit {feasibility.initial.limit_mps2:.3f}, "
+        f"{'PASS' if feasibility.initial.passes else 'FAIL'})"
+    )
+    if feasibility.adapted_result is not None and feasibility.adapted is not None:
+        print(
+            f"Lowest passing candidate via {feasibility.adaptation_strategy}: "
+            f"M={feasibility.adapted_result.past_connect_time_s:.2f} s, "
+            f"N={feasibility.adapted_result.future_recover_time_s:.2f} s, "
+            f"max |a_lat|={feasibility.adapted.max_abs_augmented_lateral_accel_mps2:.3f} m/s^2"
+        )
+    elif feasibility.adaptation_strategy == "search disabled":
+        print("Adaptive bridge search disabled.")
+    elif not feasibility.initial.passes:
+        print("No feasible M/N candidate found within the available full GT horizon.")
     print(f"End delta at +8s: {end_delta:.3f} m")
     print(f"Max |curvature| in output window: {float(np.max(np.abs(curvature))):.4f} 1/m")
 

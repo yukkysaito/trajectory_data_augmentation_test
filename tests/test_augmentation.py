@@ -17,6 +17,7 @@ from diffusion_planner_augmentation import (
     list_pattern_names,
     load_test_pattern,
     sample_centerline,
+    search_lateral_accel_feasible_result,
     speed_from_trajectory,
     write_test_pattern_csvs,
 )
@@ -198,6 +199,48 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
                     yaw_offset_deg,
                     delta=1.0,
                 )
+
+    def test_lateral_accel_search_finds_lowest_n_before_extending_m(self) -> None:
+        gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
+        result = augment_trajectory_bidirectional(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=3.0,
+            heading_offset_rad=np.deg2rad(10.0),
+            future_recover_time_s=0.5,
+            past_connect_time_s=2.0,
+            pattern_name="curve_decelerating",
+        )
+        diagnostics = search_lateral_accel_feasible_result(result, max_lateral_accel_mps2=4.0)
+
+        self.assertFalse(diagnostics.initial.passes)
+        self.assertIsNotNone(diagnostics.adapted_result)
+        self.assertIsNotNone(diagnostics.adapted)
+        self.assertEqual(diagnostics.adaptation_strategy, "extend N")
+        self.assertAlmostEqual(diagnostics.adapted_result.past_connect_time_s, 2.0, places=6)
+        self.assertGreater(diagnostics.adapted_result.future_recover_time_s, 0.5)
+        self.assertTrue(diagnostics.adapted.passes)
+
+    def test_lateral_accel_search_extends_m_when_n_only_is_insufficient(self) -> None:
+        gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
+        result = augment_trajectory_bidirectional(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=3.0,
+            heading_offset_rad=np.deg2rad(10.0),
+            future_recover_time_s=0.5,
+            past_connect_time_s=0.5,
+            pattern_name="curve_decelerating",
+        )
+        diagnostics = search_lateral_accel_feasible_result(result, max_lateral_accel_mps2=3.0)
+
+        self.assertFalse(diagnostics.initial.passes)
+        self.assertIsNotNone(diagnostics.adapted_result)
+        self.assertIsNotNone(diagnostics.adapted)
+        self.assertEqual(diagnostics.adaptation_strategy, "extend M and N")
+        self.assertGreater(diagnostics.adapted_result.past_connect_time_s, 0.5)
+        self.assertGreater(diagnostics.adapted_result.future_recover_time_s, 0.5)
+        self.assertTrue(diagnostics.adapted.passes)
 
 
 if __name__ == "__main__":
