@@ -61,6 +61,21 @@ The GT trajectory is treated as a centerline. The augmented path is constructed 
 
 This keeps the path smooth while preserving feasible longitudinal progress.
 
+## Lateral Acceleration Feasibility
+
+The repository also evaluates lateral acceleration in the output window:
+
+- `a_lat = v^2 * kappa`
+- `v` is taken from the exact arc-length progress used by the augmentation logic
+- `kappa` is computed from the final sampled trajectory
+
+If a requested augmentation exceeds `--max-lateral-accel`, the visualization highlights the violation and also searches for the lowest passing bridge-time candidate:
+
+1. find the minimum feasible `N`
+2. if that is still insufficient, find the minimum feasible pair `(M, N)`
+
+When `--recover-time` and `--past-connect-time` are omitted, the demo starts from an auto-search seed of `0.1 s` and directly selects the lowest feasible bridge times it can find within the available full GT horizon.
+
 ## Files
 
 - `diffusion_planner_augmentation.py`: augmentation implementation, CSV pattern generation/loading, visualization utilities, and CLI
@@ -93,20 +108,48 @@ python3 diffusion_planner_augmentation.py \
   --offset -3.0 \
   --recover-time 1.5 \
   --past-connect-time 1.0 \
+  --max-lateral-accel 3.0 \
   --output augmentation_demo.png
 ```
 
-This generates a 3-panel figure with:
+This generates a 4-panel figure with:
 
 - trajectory
 - speed
 - curvature
+- lateral acceleration
 
 The trajectory panel shows:
 
 - full GT context in light gray
 - the actual `[-3 s, +8 s]` output window
 - a triangle marker at every `0.1 s` pose for both GT and augmented trajectories, so temporal spacing and heading are visible
+
+The lateral-acceleration panel shows:
+
+- GT lateral acceleration
+- the requested augmentation, or the auto-search seed if `M/N` were omitted
+- red markers where the requested trajectory exceeds the limit
+- the lowest passing candidate, if one is found
+
+## Run a Single Example With Automatic Bridge-Time Search
+
+```bash
+python3 diffusion_planner_augmentation.py \
+  --pattern curve_decelerating \
+  --offset 3.0 \
+  --yaw-offset-deg 10.0 \
+  --max-lateral-accel 3.0 \
+  --output augmentation_demo_auto_bridge.png
+```
+
+In this mode:
+
+- the search starts from `M = 0.1 s`, `N = 0.1 s`
+- it first searches for the minimum feasible `N`
+- if that still fails, it searches for the minimum feasible `(M, N)` pair
+
+If you want a fixed `M/N` visualization with diagnostics only, keep `--recover-time` and `--past-connect-time` explicitly set.
 
 ## Run the Full Sweep
 
@@ -145,6 +188,7 @@ The test suite checks:
 - continuity at `t0`
 - bounded curvature and curvature variation
 - visible endpoint lag at `+8 s` for a representative large-offset case
+- lateral-acceleration feasibility search for both the `N-only` and `(M, N)` fallback paths
 
 ## Notes
 

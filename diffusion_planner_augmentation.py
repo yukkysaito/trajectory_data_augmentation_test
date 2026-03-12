@@ -19,6 +19,7 @@ FULL_FUTURE_HORIZON_S = 10.0
 OUTPUT_PAST_HORIZON_S = 3.0
 OUTPUT_FUTURE_HORIZON_S = 8.0
 DEFAULT_DT = 0.1
+MIN_BRIDGE_TIME_S = 0.1
 
 SHAPE_NAMES = ("straight", "curve", "s_curve")
 SPEED_PROFILE_NAMES = ("constant", "decelerating", "accelerating")
@@ -1030,6 +1031,8 @@ def make_demo_figure(
     )
 
     adapted_result = feasibility.adapted_result if feasibility is not None else None
+    if adapted_result is result:
+        adapted_result = None
     adapted = adapted_result.augmented_window if adapted_result is not None else None
     adapted_arc_speed = None
     adapted_curvature = None
@@ -1136,7 +1139,7 @@ def make_demo_figure(
             initial_diag.augmented_lateral_accel_mps2,
             color="#ff7f0e",
             lw=2.0,
-            label="Requested augmentation",
+            label="Auto-search seed",
         )
         violation_mask = np.abs(initial_diag.augmented_lateral_accel_mps2) > initial_diag.limit_mps2 + 1.0e-9
         if np.any(violation_mask):
@@ -1161,6 +1164,7 @@ def make_demo_figure(
         axes[3].axhline(-initial_diag.limit_mps2, color="#d62728", ls="--", lw=1.2)
         axes[3].axvline(0.0, color="0.35", ls=":", lw=1.2)
         axes[3].set_xlim(initial_diag.time[0], initial_diag.time[-1])
+        axes[3].set_ylim(-2.0 * initial_diag.limit_mps2, 2.0 * initial_diag.limit_mps2)
         axes[3].set_title("Lateral Acceleration")
         axes[3].set_xlabel("time [s]")
         axes[3].set_ylabel("a_lat [m/s^2]")
@@ -1170,7 +1174,7 @@ def make_demo_figure(
         status_lines = [
             f"limit={initial_diag.limit_mps2:.2f} m/s^2",
             (
-                f"requested: {'PASS' if initial_diag.passes else 'FAIL'} "
+                f"seed: {'PASS' if initial_diag.passes else 'FAIL'} "
                 f"(max={initial_diag.max_abs_augmented_lateral_accel_mps2:.2f})"
             ),
         ]
@@ -1213,7 +1217,7 @@ def make_demo_figure(
         f"end_delta@8s={end_delta:.3f} m",
     ]
     if feasibility is not None and not feasibility.initial.passes:
-        if feasibility.adapted_result is not None:
+        if feasibility.adapted_result is not None and feasibility.adapted_result is not result:
             title_parts.append(
                 (
                     f"{feasibility.adaptation_strategy}: "
@@ -1221,6 +1225,8 @@ def make_demo_figure(
                     f"N*={feasibility.adapted_result.future_recover_time_s:.1f} s"
                 )
             )
+        elif feasibility.adapted_result is result:
+            title_parts.append(f"selected via {feasibility.adaptation_strategy}")
         elif feasibility.adaptation_strategy == "search disabled":
             title_parts.append("lat-accel: adaptive search disabled")
         else:
@@ -1240,29 +1246,45 @@ def run_demo(
     output_path: Path,
     offset_m: float | None,
     yaw_offset_deg: float,
-    recover_time_s: float,
-    past_connect_time_s: float,
+    recover_time_s: float | None,
+    past_connect_time_s: float | None,
     max_lateral_accel_mps2: float,
     adaptive_bridge_search: bool,
-) -> tuple[BidirectionalAugmentationResult, FeasibilitySearchDiagnostics]:
+) -> tuple[
+    BidirectionalAugmentationResult,
+    FeasibilitySearchDiagnostics,
+    float,
+    float,
+]:
     gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
     rng = np.random.default_rng(seed)
     lateral_offset_m = offset_m if offset_m is not None else sample_random_lateral_offset(rng)
-    result = augment_trajectory_bidirectional(
+    initial_recover_time_s = (
+        recover_time_s if recover_time_s is not None else MIN_BRIDGE_TIME_S
+    )
+    initial_past_connect_time_s = (
+        past_connect_time_s if past_connect_time_s is not None else MIN_BRIDGE_TIME_S
+    )
+    auto_bridge_search = (recover_time_s is None) or (past_connect_time_s is None)
+
+    initial_result = augment_trajectory_bidirectional(
         gt=gt,
         current_index=current_index,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=np.deg2rad(yaw_offset_deg),
-        future_recover_time_s=recover_time_s,
-        past_connect_time_s=past_connect_time_s,
+        future_recover_time_s=initial_recover_time_s,
+        past_connect_time_s=initial_past_connect_time_s,
         output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
         output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
         pattern_name=pattern_name,
     )
     feasibility = search_lateral_accel_feasible_result(
-        initial_result=result,
+        initial_result=initial_result,
         max_lateral_accel_mps2=max_lateral_accel_mps2,
     )
+    result = initial_result
+    if adaptive_bridge_search and auto_bridge_search and feasibility.adapted_result is not None:
+        result = feasibility.adapted_result
     if not adaptive_bridge_search:
         feasibility = FeasibilitySearchDiagnostics(
             initial=feasibility.initial,
@@ -1271,7 +1293,7 @@ def run_demo(
             adaptation_strategy="search disabled",
         )
     make_demo_figure(result, output_path=output_path, feasibility=feasibility)
-    return result, feasibility
+    return result, feasibility, initial_recover_time_s, initial_past_connect_time_s
 
 
 def run_sweep(
@@ -1334,8 +1356,24 @@ def main() -> None:
     parser.add_argument("--pattern", type=str, default=DEFAULT_PATTERN_NAME)
     parser.add_argument("--pattern-dir", type=Path, default=DEFAULT_PATTERN_DIR)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--recover-time", type=float, default=1.5)
-    parser.add_argument("--past-connect-time", type=float, default=1.0)
+    parser.add_argument(
+        "--recover-time",
+        type=float,
+        default=None,
+        help=(
+            "Requested future bridge time N [s]. If omitted, start from "
+            f"{MIN_BRIDGE_TIME_S:.1f}s and auto-search the minimum feasible N."
+        ),
+    )
+    parser.add_argument(
+        "--past-connect-time",
+        type=float,
+        default=None,
+        help=(
+            "Requested past bridge time M [s]. If omitted, start from "
+            f"{MIN_BRIDGE_TIME_S:.1f}s and auto-search the minimum feasible M,N pair."
+        ),
+    )
     parser.add_argument("--offset", type=float, default=None)
     parser.add_argument("--yaw-offset-deg", type=float, default=0.0)
     parser.add_argument(
@@ -1398,7 +1436,7 @@ def main() -> None:
             print(f"Last image: {output_paths[-1]}")
         return
 
-    result, feasibility = run_demo(
+    result, feasibility, initial_recover_time_s, initial_past_connect_time_s = run_demo(
         pattern_name=args.pattern,
         pattern_dir=args.pattern_dir,
         seed=args.seed,
@@ -1440,8 +1478,16 @@ def main() -> None:
     )
     print(f"Lateral offset: {result.lateral_offset_m:+.3f} m")
     print(f"Heading offset: {np.degrees(result.heading_offset_rad):+.1f} deg")
-    print(f"Past bridge M: {result.past_connect_time_s:.2f} s")
-    print(f"Future bridge N: {result.future_recover_time_s:.2f} s")
+    print(f"Initial past bridge M: {initial_past_connect_time_s:.2f} s")
+    print(f"Initial future bridge N: {initial_recover_time_s:.2f} s")
+    if not np.isclose(result.past_connect_time_s, initial_past_connect_time_s) or not np.isclose(
+        result.future_recover_time_s, initial_recover_time_s
+    ):
+        print(f"Selected past bridge M: {result.past_connect_time_s:.2f} s")
+        print(f"Selected future bridge N: {result.future_recover_time_s:.2f} s")
+    else:
+        print(f"Past bridge M: {result.past_connect_time_s:.2f} s")
+        print(f"Future bridge N: {result.future_recover_time_s:.2f} s")
     print(f"Past speed scale: {result.past_segment.connect_speed_scale:.3f}")
     print(f"Future speed scale: {result.future_segment.connect_speed_scale:.3f}")
     print(f"Max exact-arc speed abs diff vs GT in output window: {arc_speed_abs_diff:.3f} m/s")
