@@ -11,7 +11,9 @@ from diffusion_planner_augmentation import (
     augment_future_trajectory,
     augment_trajectory_bidirectional,
     cumulative_distance,
+    chord_speed_from_trajectory,
     curvature_from_xy,
+    exact_arc_speed_in_window,
     list_pattern_names,
     load_test_pattern,
     sample_centerline,
@@ -156,6 +158,23 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
             )
         )
         self.assertGreater(float(end_delta), 0.1)
+
+    def test_exact_arc_speed_matches_gt_even_when_chord_speed_deviates(self) -> None:
+        gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
+        result = augment_trajectory_bidirectional(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=3.0,
+            future_recover_time_s=0.5,
+            past_connect_time_s=0.5,
+            pattern_name="curve_decelerating",
+        )
+        gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
+        gt_chord_speed = chord_speed_from_trajectory(result.original_window)
+        augmented_chord_speed = chord_speed_from_trajectory(result.augmented_window)
+
+        self.assertLess(float(np.max(np.abs(augmented_arc_speed - gt_arc_speed))), 5.0e-3)
+        self.assertGreater(float(np.max(np.abs(augmented_chord_speed - gt_chord_speed))), 0.3)
 
 
 if __name__ == "__main__":

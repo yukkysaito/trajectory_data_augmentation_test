@@ -66,6 +66,7 @@ class SegmentAugmentationResult:
     centerline: Centerline
     dense_augmented_path: DensePath
     distance_profile: np.ndarray
+    progress_profile: np.ndarray
     connect_time_s: float
     merge_centerline_s: float
     merge_path_length_m: float
@@ -165,6 +166,34 @@ def speed_from_trajectory(traj: Trajectory2D) -> np.ndarray:
     if len(traj.t) < 3:
         return np.zeros_like(traj.t, dtype=float)
     return np.gradient(distance, strictly_increasing_param(traj.t), edge_order=2)
+
+
+def speed_from_progress(progress: np.ndarray, time: np.ndarray) -> np.ndarray:
+    if len(time) < 3:
+        return np.zeros_like(time, dtype=float)
+    return np.gradient(progress, strictly_increasing_param(time), edge_order=2)
+
+
+def chord_speed_from_trajectory(traj: Trajectory2D) -> np.ndarray:
+    if len(traj.t) < 2:
+        return np.zeros_like(traj.t, dtype=float)
+
+    time = strictly_increasing_param(traj.t)
+    speed = np.zeros_like(traj.t, dtype=float)
+
+    if len(traj.t) == 2:
+        value = np.hypot(traj.x[1] - traj.x[0], traj.y[1] - traj.y[0]) / (time[1] - time[0])
+        speed[:] = value
+        return speed
+
+    speed[0] = np.hypot(traj.x[1] - traj.x[0], traj.y[1] - traj.y[0]) / (time[1] - time[0])
+    speed[-1] = np.hypot(traj.x[-1] - traj.x[-2], traj.y[-1] - traj.y[-2]) / (time[-1] - time[-2])
+
+    span_x = traj.x[2:] - traj.x[:-2]
+    span_y = traj.y[2:] - traj.y[:-2]
+    span_t = time[2:] - time[:-2]
+    speed[1:-1] = np.hypot(span_x, span_y) / span_t
+    return speed
 
 
 def smoothstep(unit_value: np.ndarray) -> np.ndarray:
@@ -515,10 +544,12 @@ def augment_directed_segment(
     connect_mask = segment.t <= connect_time_s + 1.0e-9
     query_x = np.zeros_like(segment.x)
     query_y = np.zeros_like(segment.y)
+    progress_profile = np.zeros_like(segment.t)
 
     connect_sigma = connect_speed_scale * distance_profile[connect_mask]
     query_x[connect_mask] = np.interp(connect_sigma, merge_path.sigma, merge_path.x)
     query_y[connect_mask] = np.interp(connect_sigma, merge_path.sigma, merge_path.y)
+    progress_profile[connect_mask] = connect_sigma
 
     continue_mask = ~connect_mask
     if np.any(continue_mask):
@@ -526,6 +557,7 @@ def augment_directed_segment(
         cont_x, cont_y, _ = sample_centerline(centerline, continue_s)
         query_x[continue_mask] = cont_x
         query_y[continue_mask] = cont_y
+        progress_profile[continue_mask] = merge_path.sigma[-1] + (distance_profile[continue_mask] - connect_budget_m)
 
     directional_yaw = compute_forward_yaw(query_x, query_y, fallback_yaw=segment.yaw)
     augmented_segment = Trajectory2D(
@@ -541,6 +573,7 @@ def augment_directed_segment(
         centerline=centerline,
         dense_augmented_path=dense_full_path,
         distance_profile=distance_profile,
+        progress_profile=progress_profile,
         connect_time_s=connect_time_s,
         merge_centerline_s=s_merge,
         merge_path_length_m=merge_path.sigma[-1],
@@ -682,6 +715,30 @@ def format_offset_suffix(value_m: float) -> str:
     return f"_offset{sign}{magnitude}m"
 
 
+def exact_arc_speed_in_window(result: BidirectionalAugmentationResult) -> tuple[np.ndarray, np.ndarray]:
+    past_gt_speed = speed_from_progress(
+        result.past_segment.distance_profile,
+        result.past_segment.original_segment.t,
+    )[::-1]
+    past_aug_speed = speed_from_progress(
+        result.past_segment.progress_profile,
+        result.past_segment.augmented_segment.t,
+    )[::-1]
+    future_gt_speed = speed_from_progress(
+        result.future_segment.distance_profile,
+        result.future_segment.original_segment.t,
+    )
+    future_aug_speed = speed_from_progress(
+        result.future_segment.progress_profile,
+        result.future_segment.augmented_segment.t,
+    )
+
+    gt_full_speed = np.concatenate((past_gt_speed[:-1], future_gt_speed))
+    aug_full_speed = np.concatenate((past_aug_speed[:-1], future_aug_speed))
+    window_slice = slice(result.window_start_index, result.window_end_index + 1)
+    return gt_full_speed[window_slice], aug_full_speed[window_slice]
+
+
 def plot_pose_triangles(
     ax: plt.Axes,
     x: np.ndarray,
@@ -710,8 +767,9 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
     gt = result.original_window
     augmented = result.augmented_window
 
-    gt_speed = speed_from_trajectory(gt)
-    augmented_speed = speed_from_trajectory(augmented)
+    gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
+    gt_chord_speed = chord_speed_from_trajectory(gt)
+    augmented_chord_speed = chord_speed_from_trajectory(augmented)
     gt_curvature = curvature_from_xy(gt.x, gt.y, cumulative_distance(gt.x, gt.y))
     augmented_curvature = curvature_from_xy(augmented.x, augmented.y, cumulative_distance(augmented.x, augmented.y))
 
@@ -755,13 +813,15 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="best")
 
-    axes[1].plot(gt.t, gt_speed, color="0.55", lw=2.0, label="GT window")
-    axes[1].plot(augmented.t, augmented_speed, color="#ff7f0e", lw=2.0, label="Augmented window")
+    axes[1].plot(gt.t, gt_arc_speed, color="0.45", lw=2.0, label="GT exact arc")
+    axes[1].plot(gt.t, gt_chord_speed, color="0.55", lw=1.7, ls="--", label="GT chord")
+    axes[1].plot(augmented.t, augmented_arc_speed, color="#ff7f0e", lw=2.0, label="Aug exact arc")
+    axes[1].plot(augmented.t, augmented_chord_speed, color="#d95f02", lw=1.7, ls="--", label="Aug chord")
     axes[1].axvline(-result.past_connect_time_s, color="#1f77b4", ls="--", lw=1.2)
     axes[1].axvline(0.0, color="0.35", ls=":", lw=1.2)
     axes[1].axvline(result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
     axes[1].set_xlim(gt.t[0], gt.t[-1])
-    axes[1].set_title("Speed")
+    axes[1].set_title("Speed (Arc + Chord)")
     axes[1].set_xlabel("time [s]")
     axes[1].set_ylabel("speed [m/s]")
     axes[1].grid(True, alpha=0.25)
@@ -924,9 +984,11 @@ def main() -> None:
         past_connect_time_s=args.past_connect_time,
     )
 
-    gt_speed = speed_from_trajectory(result.original_window)
-    augmented_speed = speed_from_trajectory(result.augmented_window)
-    speed_margin = float(np.max(augmented_speed - gt_speed))
+    gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
+    gt_chord_speed = chord_speed_from_trajectory(result.original_window)
+    augmented_chord_speed = chord_speed_from_trajectory(result.augmented_window)
+    arc_speed_abs_diff = float(np.max(np.abs(augmented_arc_speed - gt_arc_speed)))
+    chord_speed_abs_diff = float(np.max(np.abs(augmented_chord_speed - gt_chord_speed)))
     curvature = curvature_from_xy(
         result.augmented_window.x,
         result.augmented_window.y,
@@ -954,7 +1016,8 @@ def main() -> None:
     print(f"Future bridge N: {result.future_recover_time_s:.2f} s")
     print(f"Past speed scale: {result.past_segment.connect_speed_scale:.3f}")
     print(f"Future speed scale: {result.future_segment.connect_speed_scale:.3f}")
-    print(f"Max speed margin vs GT in output window: {speed_margin:.3f} m/s")
+    print(f"Max exact-arc speed abs diff vs GT in output window: {arc_speed_abs_diff:.3f} m/s")
+    print(f"Max chord-speed abs diff vs GT in output window: {chord_speed_abs_diff:.3f} m/s")
     print(f"End delta at +8s: {end_delta:.3f} m")
     print(f"Max |curvature| in output window: {float(np.max(np.abs(curvature))):.4f} 1/m")
 
