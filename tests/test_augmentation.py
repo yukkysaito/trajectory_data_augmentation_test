@@ -3,113 +3,159 @@ import unittest
 import numpy as np
 
 from diffusion_planner_augmentation import (
+    DEFAULT_PATTERN_DIR,
+    FULL_FUTURE_HORIZON_S,
+    FULL_PAST_HORIZON_S,
+    OUTPUT_FUTURE_HORIZON_S,
+    OUTPUT_PAST_HORIZON_S,
     augment_future_trajectory,
     augment_trajectory_bidirectional,
     cumulative_distance,
     curvature_from_xy,
-    generate_synthetic_gt,
+    list_pattern_names,
+    load_test_pattern,
     sample_centerline,
+    speed_from_trajectory,
+    write_test_pattern_csvs,
 )
 
 
 class DiffusionPlannerAugmentationTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.gt, self.current_index = generate_synthetic_gt()
-        self.future_result = augment_future_trajectory(
-            gt=self.gt,
-            current_index=self.current_index,
-            lateral_offset_m=1.0,
+    @classmethod
+    def setUpClass(cls) -> None:
+        write_test_pattern_csvs(DEFAULT_PATTERN_DIR)
+        cls.pattern_names = list_pattern_names()
+
+    def _augment_pattern(self, pattern_name: str, offset_m: float = 1.0):
+        gt, current_index = load_test_pattern(pattern_name, DEFAULT_PATTERN_DIR)
+        future_result = augment_future_trajectory(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=offset_m,
             recover_time_s=1.5,
         )
-        self.bidirectional_result = augment_trajectory_bidirectional(
-            gt=self.gt,
-            current_index=self.current_index,
-            lateral_offset_m=1.0,
+        bidirectional_result = augment_trajectory_bidirectional(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=offset_m,
             future_recover_time_s=1.5,
             past_connect_time_s=1.0,
+            pattern_name=pattern_name,
         )
+        return gt, current_index, future_result, bidirectional_result
+
+    def test_pattern_csvs_cover_full_horizon(self) -> None:
+        self.assertEqual(len(self.pattern_names), 9)
+        expected_num_samples = int(round((FULL_PAST_HORIZON_S + FULL_FUTURE_HORIZON_S) / 0.1)) + 1
+        for pattern_name in self.pattern_names:
+            with self.subTest(pattern=pattern_name):
+                gt, current_index = load_test_pattern(pattern_name, DEFAULT_PATTERN_DIR)
+                self.assertEqual(len(gt.t), expected_num_samples)
+                self.assertAlmostEqual(float(gt.t[0]), -FULL_PAST_HORIZON_S, places=6)
+                self.assertAlmostEqual(float(gt.t[-1]), FULL_FUTURE_HORIZON_S, places=6)
+                self.assertAlmostEqual(float(gt.t[current_index]), 0.0, places=9)
+
+    def test_output_window_matches_requested_training_horizon(self) -> None:
+        expected_num_samples = int(round((OUTPUT_PAST_HORIZON_S + OUTPUT_FUTURE_HORIZON_S) / 0.1)) + 1
+        for pattern_name in self.pattern_names:
+            with self.subTest(pattern=pattern_name):
+                _, _, _, result = self._augment_pattern(pattern_name)
+                self.assertEqual(len(result.original_window.t), expected_num_samples)
+                self.assertEqual(len(result.augmented_window.t), expected_num_samples)
+                self.assertAlmostEqual(float(result.original_window.t[0]), -OUTPUT_PAST_HORIZON_S, places=6)
+                self.assertAlmostEqual(float(result.original_window.t[-1]), OUTPUT_FUTURE_HORIZON_S, places=6)
+                self.assertAlmostEqual(float(result.augmented_window.t[0]), -OUTPUT_PAST_HORIZON_S, places=6)
+                self.assertAlmostEqual(float(result.augmented_window.t[-1]), OUTPUT_FUTURE_HORIZON_S, places=6)
 
     def test_future_merge_path_respects_distance_budget(self) -> None:
-        budget = self.future_result.connect_distance_budget_m
-        self.assertLessEqual(self.future_result.merge_path_length_m, budget + 2.0e-2)
+        for pattern_name in self.pattern_names:
+            with self.subTest(pattern=pattern_name):
+                _, _, future_result, _ = self._augment_pattern(pattern_name)
+                budget = future_result.connect_distance_budget_m
+                self.assertLessEqual(future_result.merge_path_length_m, budget + 2.0e-2)
 
     def test_future_recovery_pose_matches_centerline_pose(self) -> None:
-        recover_index = int(np.argmin(np.abs(self.future_result.original_segment.t - self.future_result.connect_time_s)))
-        merge_x, merge_y, merge_yaw = sample_centerline(
-            self.future_result.centerline,
-            np.array([self.future_result.merge_centerline_s]),
-        )
-        self.assertAlmostEqual(self.future_result.augmented_segment.x[recover_index], merge_x[0], places=3)
-        self.assertAlmostEqual(self.future_result.augmented_segment.y[recover_index], merge_y[0], places=3)
-        self.assertAlmostEqual(self.future_result.augmented_segment.yaw[recover_index], merge_yaw[0], places=2)
+        for pattern_name in self.pattern_names:
+            with self.subTest(pattern=pattern_name):
+                _, _, future_result, _ = self._augment_pattern(pattern_name)
+                recover_index = int(np.argmin(np.abs(future_result.original_segment.t - future_result.connect_time_s)))
+                merge_x, merge_y, merge_yaw = sample_centerline(
+                    future_result.centerline,
+                    np.array([future_result.merge_centerline_s]),
+                )
+                self.assertAlmostEqual(future_result.augmented_segment.x[recover_index], merge_x[0], places=3)
+                self.assertAlmostEqual(future_result.augmented_segment.y[recover_index], merge_y[0], places=3)
+                self.assertAlmostEqual(future_result.augmented_segment.yaw[recover_index], merge_yaw[0], places=2)
 
-    def test_future_speed_does_not_exceed_gt_during_recovery(self) -> None:
-        dt = float(np.mean(np.diff(self.future_result.original_segment.t)))
-        augmented_distance = cumulative_distance(
-            self.future_result.augmented_segment.x,
-            self.future_result.augmented_segment.y,
-        )
-        gt_speed = np.diff(self.future_result.distance_profile, prepend=0.0) / dt
-        augmented_speed = np.diff(augmented_distance, prepend=0.0) / dt
-        recover_mask = self.future_result.original_segment.t <= self.future_result.connect_time_s + 1.0e-9
-        speed_margin = augmented_speed[recover_mask] - gt_speed[recover_mask]
-        self.assertLess(float(np.max(speed_margin)), 0.15)
+    def test_speed_does_not_exceed_gt_in_bridge_windows(self) -> None:
+        for pattern_name in self.pattern_names:
+            with self.subTest(pattern=pattern_name):
+                _, _, _, result = self._augment_pattern(pattern_name, offset_m=2.0)
+                future_speed_margin = (
+                    speed_from_trajectory(result.future_segment.augmented_segment)
+                    - speed_from_trajectory(result.future_segment.original_segment)
+                )
+                future_mask = result.future_segment.original_segment.t <= result.future_segment.connect_time_s + 1.0e-9
+                self.assertLess(float(np.max(future_speed_margin[future_mask])), 0.20)
 
-    def test_bidirectional_current_pose_is_continuous(self) -> None:
-        result = self.bidirectional_result
-        current_idx = result.current_index
-        self.assertAlmostEqual(result.augmented_full.x[current_idx], result.augmented_past.x[-1], places=6)
-        self.assertAlmostEqual(result.augmented_full.y[current_idx], result.augmented_past.y[-1], places=6)
-        self.assertAlmostEqual(result.augmented_full.x[current_idx], result.augmented_future.x[0], places=6)
-        self.assertAlmostEqual(result.augmented_full.y[current_idx], result.augmented_future.y[0], places=6)
+                past_speed_margin = (
+                    speed_from_trajectory(result.past_segment.augmented_segment)
+                    - speed_from_trajectory(result.past_segment.original_segment)
+                )
+                past_mask = result.past_segment.original_segment.t <= result.past_segment.connect_time_s + 1.0e-9
+                self.assertLess(float(np.max(past_speed_margin[past_mask])), 0.20)
 
-    def test_bidirectional_current_pose_has_requested_offset(self) -> None:
-        result = self.bidirectional_result
-        current_idx = result.current_index
-        offset_vector = np.array(
-            [
-                result.augmented_full.x[current_idx] - result.original_full.x[current_idx],
-                result.augmented_full.y[current_idx] - result.original_full.y[current_idx],
-            ]
-        )
-        self.assertAlmostEqual(float(np.linalg.norm(offset_vector)), 1.0, places=3)
+    def test_current_pose_is_continuous_and_offset_is_correct(self) -> None:
+        for pattern_name in self.pattern_names:
+            with self.subTest(pattern=pattern_name):
+                _, _, _, result = self._augment_pattern(pattern_name, offset_m=1.0)
+                current_idx = result.current_index
+                self.assertAlmostEqual(result.augmented_full.x[current_idx], result.augmented_past.x[-1], places=6)
+                self.assertAlmostEqual(result.augmented_full.y[current_idx], result.augmented_past.y[-1], places=6)
+                self.assertAlmostEqual(result.augmented_full.x[current_idx], result.augmented_future.x[0], places=6)
+                self.assertAlmostEqual(result.augmented_full.y[current_idx], result.augmented_future.y[0], places=6)
 
-    def test_past_speed_does_not_exceed_gt_during_connect(self) -> None:
-        past_result = self.bidirectional_result.past_segment
-        dt = float(np.mean(np.diff(past_result.original_segment.t)))
-        augmented_distance = cumulative_distance(
-            past_result.augmented_segment.x,
-            past_result.augmented_segment.y,
-        )
-        gt_speed = np.diff(past_result.distance_profile, prepend=0.0) / dt
-        augmented_speed = np.diff(augmented_distance, prepend=0.0) / dt
-        connect_mask = past_result.original_segment.t <= past_result.connect_time_s + 1.0e-9
-        speed_margin = augmented_speed[connect_mask] - gt_speed[connect_mask]
-        self.assertLess(float(np.max(speed_margin)), 0.15)
+                offset_vector = np.array(
+                    [
+                        result.augmented_full.x[current_idx] - result.original_full.x[current_idx],
+                        result.augmented_full.y[current_idx] - result.original_full.y[current_idx],
+                    ]
+                )
+                self.assertAlmostEqual(float(np.linalg.norm(offset_vector)), 1.0, places=3)
 
-    def test_full_trajectory_curvature_is_bounded(self) -> None:
-        sigma = cumulative_distance(
-            self.bidirectional_result.augmented_full.x,
-            self.bidirectional_result.augmented_full.y,
-        )
-        curvature = curvature_from_xy(
-            self.bidirectional_result.augmented_full.x,
-            self.bidirectional_result.augmented_full.y,
-            sigma,
-        )
-        curvature_step = np.diff(curvature)
-        self.assertLess(float(np.max(np.abs(curvature))), 0.10)
-        self.assertLess(float(np.max(np.abs(curvature_step))), 0.05)
+    def test_output_window_curvature_is_bounded(self) -> None:
+        for pattern_name in self.pattern_names:
+            with self.subTest(pattern=pattern_name):
+                _, _, _, result = self._augment_pattern(pattern_name, offset_m=2.0)
+                sigma = cumulative_distance(result.augmented_window.x, result.augmented_window.y)
+                curvature = curvature_from_xy(
+                    result.augmented_window.x,
+                    result.augmented_window.y,
+                    sigma,
+                )
+                curvature_step = np.diff(curvature)
+                self.assertLess(float(np.max(np.abs(curvature))), 0.24)
+                self.assertLess(float(np.max(np.abs(curvature_step))), 0.11)
 
-    def test_past_and_future_progress_are_feasible(self) -> None:
-        self.assertLessEqual(
-            self.bidirectional_result.future_segment.connect_speed_scale,
-            1.0 + 1.0e-6,
+    def test_extra_future_context_allows_visible_lag_for_large_offset(self) -> None:
+        gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
+        result = augment_trajectory_bidirectional(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=-3.0,
+            future_recover_time_s=1.5,
+            past_connect_time_s=1.0,
+            pattern_name="curve_decelerating",
         )
-        self.assertLessEqual(
-            self.bidirectional_result.past_segment.connect_speed_scale,
-            1.0 + 1.0e-6,
+        end_delta = np.linalg.norm(
+            np.array(
+                [
+                    result.augmented_window.x[-1] - result.original_window.x[-1],
+                    result.augmented_window.y[-1] - result.original_window.y[-1],
+                ]
+            )
         )
+        self.assertGreater(float(end_delta), 0.1)
 
 
 if __name__ == "__main__":

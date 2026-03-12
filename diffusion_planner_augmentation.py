@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,19 @@ import numpy as np
 warnings.filterwarnings("ignore", message="Unable to import Axes3D", module="matplotlib.projections")
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+
+FULL_PAST_HORIZON_S = 5.0
+FULL_FUTURE_HORIZON_S = 10.0
+OUTPUT_PAST_HORIZON_S = 3.0
+OUTPUT_FUTURE_HORIZON_S = 8.0
+DEFAULT_DT = 0.1
+
+SHAPE_NAMES = ("straight", "curve", "s_curve")
+SPEED_PROFILE_NAMES = ("constant", "decelerating", "accelerating")
+
+DEFAULT_PATTERN_NAME = "s_curve_constant"
+DEFAULT_PATTERN_DIR = Path(__file__).resolve().parent / "test_patterns"
 
 
 @dataclass
@@ -62,15 +76,20 @@ class SegmentAugmentationResult:
 
 @dataclass
 class BidirectionalAugmentationResult:
+    pattern_name: str
     original_full: Trajectory2D
     augmented_full: Trajectory2D
     original_past: Trajectory2D
     original_future: Trajectory2D
     augmented_past: Trajectory2D
     augmented_future: Trajectory2D
+    original_window: Trajectory2D
+    augmented_window: Trajectory2D
     past_segment: SegmentAugmentationResult
     future_segment: SegmentAugmentationResult
     current_index: int
+    window_start_index: int
+    window_end_index: int
     lateral_offset_m: float
     past_connect_time_s: float
     future_recover_time_s: float
@@ -148,23 +167,63 @@ def speed_from_trajectory(traj: Trajectory2D) -> np.ndarray:
     return np.gradient(distance, strictly_increasing_param(traj.t), edge_order=2)
 
 
-def generate_synthetic_gt(
-    past_horizon_s: float = 3.0,
-    future_horizon_s: float = 8.0,
-    dt: float = 0.1,
-) -> tuple[Trajectory2D, int]:
-    times = np.arange(-past_horizon_s, future_horizon_s + 1.0e-9, dt)
-    current_index = int(round(past_horizon_s / dt))
+def smoothstep(unit_value: np.ndarray) -> np.ndarray:
+    u = np.clip(unit_value, 0.0, 1.0)
+    return 3.0 * u**2 - 2.0 * u**3
 
-    speed = 8.2 + 0.8 * np.sin(0.45 * times - 0.1) + 0.45 * np.sin(1.10 * times + 0.4)
-    speed = np.clip(speed, 5.5, None)
 
+def split_pattern_name(pattern_name: str) -> tuple[str, str]:
+    if "_" not in pattern_name:
+        raise ValueError(f"Invalid pattern name: {pattern_name}")
+    shape_name, speed_profile_name = pattern_name.rsplit("_", 1)
+    if shape_name not in SHAPE_NAMES:
+        raise ValueError(f"Unsupported shape: {shape_name}")
+    if speed_profile_name not in SPEED_PROFILE_NAMES:
+        raise ValueError(f"Unsupported speed profile: {speed_profile_name}")
+    return shape_name, speed_profile_name
+
+
+def list_pattern_names() -> list[str]:
+    return [f"{shape}_{speed_profile}" for shape in SHAPE_NAMES for speed_profile in SPEED_PROFILE_NAMES]
+
+
+def build_speed_profile(times: np.ndarray, speed_profile_name: str) -> np.ndarray:
+    u = (times - times[0]) / (times[-1] - times[0])
+    blend = smoothstep(u)
+    if speed_profile_name == "constant":
+        speed = np.full_like(times, 8.0, dtype=float)
+    elif speed_profile_name == "decelerating":
+        speed = 10.0 - 4.0 * blend
+    elif speed_profile_name == "accelerating":
+        speed = 6.0 + 4.0 * blend
+    else:
+        raise ValueError(f"Unsupported speed profile: {speed_profile_name}")
+    return np.clip(speed, 3.0, None)
+
+
+def build_curvature_profile(s_rel: np.ndarray, shape_name: str) -> np.ndarray:
+    if shape_name == "straight":
+        curvature = np.zeros_like(s_rel)
+    elif shape_name == "curve":
+        curvature = 0.010 + 0.0015 * np.sin(0.030 * s_rel + 0.2)
+    elif shape_name == "s_curve":
+        curvature = (
+            0.014 * np.exp(-((s_rel + 12.0) / 18.0) ** 2)
+            - 0.014 * np.exp(-((s_rel - 22.0) / 18.0) ** 2)
+        )
+    else:
+        raise ValueError(f"Unsupported shape: {shape_name}")
+    return curvature
+
+
+def integrate_trajectory(
+    times: np.ndarray,
+    speed: np.ndarray,
+    curvature: np.ndarray,
+    current_index: int,
+) -> Trajectory2D:
     ds = np.zeros_like(times)
-    ds[1:] = 0.5 * (speed[1:] + speed[:-1]) * dt
-    s = np.cumsum(ds)
-    s_rel = s - s[current_index]
-
-    curvature = 0.010 * np.sin(0.075 * s_rel + 0.2) + 0.003 * np.cos(0.19 * s_rel - 0.4)
+    ds[1:] = 0.5 * (speed[1:] + speed[:-1]) * np.diff(times)
 
     yaw = np.zeros_like(times)
     x = np.zeros_like(times)
@@ -179,8 +238,88 @@ def generate_synthetic_gt(
     y -= y[current_index]
     x, y = rotate_points(x, y, -yaw[current_index])
     yaw = wrap_angle(yaw - yaw[current_index])
+    return Trajectory2D(t=times.copy(), x=x, y=y, yaw=yaw)
 
-    return Trajectory2D(t=times, x=x, y=y, yaw=yaw), current_index
+
+def generate_synthetic_gt(
+    shape_name: str = "s_curve",
+    speed_profile_name: str = "constant",
+    past_horizon_s: float = FULL_PAST_HORIZON_S,
+    future_horizon_s: float = FULL_FUTURE_HORIZON_S,
+    dt: float = DEFAULT_DT,
+) -> tuple[Trajectory2D, int]:
+    times = np.arange(-past_horizon_s, future_horizon_s + 1.0e-9, dt)
+    current_index = int(round(past_horizon_s / dt))
+
+    speed = build_speed_profile(times, speed_profile_name)
+    ds = np.zeros_like(times)
+    ds[1:] = 0.5 * (speed[1:] + speed[:-1]) * dt
+    s = np.cumsum(ds)
+    s_rel = s - s[current_index]
+    curvature = build_curvature_profile(s_rel, shape_name)
+
+    return integrate_trajectory(times, speed, curvature, current_index), current_index
+
+
+def write_trajectory_csv(traj: Trajectory2D, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    speed = speed_from_trajectory(traj)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["t", "x", "y", "yaw", "speed_mps"])
+        for row in zip(traj.t, traj.x, traj.y, traj.yaw, speed):
+            writer.writerow([f"{value:.8f}" for value in row])
+
+
+def load_trajectory_csv(path: Path) -> tuple[Trajectory2D, int]:
+    data = np.genfromtxt(path, delimiter=",", names=True)
+    traj = Trajectory2D(
+        t=np.asarray(data["t"], dtype=float),
+        x=np.asarray(data["x"], dtype=float),
+        y=np.asarray(data["y"], dtype=float),
+        yaw=np.asarray(data["yaw"], dtype=float),
+    )
+    current_matches = np.where(np.isclose(traj.t, 0.0, atol=1.0e-9))[0]
+    if len(current_matches) != 1:
+        raise ValueError(f"Expected exactly one t=0.0 sample in {path}")
+    return traj, int(current_matches[0])
+
+
+def write_test_pattern_csvs(
+    output_dir: Path = DEFAULT_PATTERN_DIR,
+    dt: float = DEFAULT_DT,
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written_paths: list[Path] = []
+    for pattern_name in list_pattern_names():
+        shape_name, speed_profile_name = split_pattern_name(pattern_name)
+        traj, _ = generate_synthetic_gt(
+            shape_name=shape_name,
+            speed_profile_name=speed_profile_name,
+            past_horizon_s=FULL_PAST_HORIZON_S,
+            future_horizon_s=FULL_FUTURE_HORIZON_S,
+            dt=dt,
+        )
+        path = output_dir / f"{pattern_name}.csv"
+        write_trajectory_csv(traj, path)
+        written_paths.append(path)
+    return written_paths
+
+
+def ensure_test_pattern_csvs(pattern_dir: Path = DEFAULT_PATTERN_DIR) -> list[Path]:
+    existing_paths = [pattern_dir / f"{pattern_name}.csv" for pattern_name in list_pattern_names()]
+    if all(path.exists() for path in existing_paths):
+        return existing_paths
+    return write_test_pattern_csvs(pattern_dir)
+
+
+def load_test_pattern(
+    pattern_name: str = DEFAULT_PATTERN_NAME,
+    pattern_dir: Path = DEFAULT_PATTERN_DIR,
+) -> tuple[Trajectory2D, int]:
+    split_pattern_name(pattern_name)
+    ensure_test_pattern_csvs(pattern_dir)
+    return load_trajectory_csv(pattern_dir / f"{pattern_name}.csv")
 
 
 def build_centerline(segment: Trajectory2D, dense_ds: float = 0.05) -> Centerline:
@@ -427,6 +566,19 @@ def augment_future_trajectory(
     )
 
 
+def extract_time_window(
+    traj: Trajectory2D,
+    start_time_s: float,
+    end_time_s: float,
+) -> tuple[Trajectory2D, int, int]:
+    indices = np.where((traj.t >= start_time_s - 1.0e-9) & (traj.t <= end_time_s + 1.0e-9))[0]
+    if len(indices) == 0:
+        raise ValueError("Requested time window is empty.")
+    start_index = int(indices[0])
+    end_index = int(indices[-1])
+    return traj.slice(start_index, end_index + 1), start_index, end_index
+
+
 def augment_trajectory_bidirectional(
     gt: Trajectory2D,
     current_index: int,
@@ -434,6 +586,9 @@ def augment_trajectory_bidirectional(
     future_recover_time_s: float,
     past_connect_time_s: float,
     dense_ds: float = 0.05,
+    output_past_horizon_s: float = OUTPUT_PAST_HORIZON_S,
+    output_future_horizon_s: float = OUTPUT_FUTURE_HORIZON_S,
+    pattern_name: str = "generated",
 ) -> BidirectionalAugmentationResult:
     future_segment = extract_future_segment(gt, current_index)
     past_reverse_segment = extract_reversed_past_segment(gt, current_index)
@@ -475,16 +630,32 @@ def augment_trajectory_bidirectional(
     augmented_past = augmented_full.slice(0, current_index + 1)
     augmented_future = augmented_full.slice(current_index, None)
 
+    original_window, window_start_index, window_end_index = extract_time_window(
+        gt,
+        start_time_s=-output_past_horizon_s,
+        end_time_s=output_future_horizon_s,
+    )
+    augmented_window, _, _ = extract_time_window(
+        augmented_full,
+        start_time_s=-output_past_horizon_s,
+        end_time_s=output_future_horizon_s,
+    )
+
     return BidirectionalAugmentationResult(
+        pattern_name=pattern_name,
         original_full=gt.slice(0, None),
         augmented_full=augmented_full,
         original_past=original_past,
         original_future=original_future,
         augmented_past=augmented_past,
         augmented_future=augmented_future,
+        original_window=original_window,
+        augmented_window=augmented_window,
         past_segment=past_result,
         future_segment=future_result,
         current_index=current_index,
+        window_start_index=window_start_index,
+        window_end_index=window_end_index,
         lateral_offset_m=lateral_offset_m,
         past_connect_time_s=past_connect_time_s,
         future_recover_time_s=future_recover_time_s,
@@ -535,16 +706,18 @@ def plot_pose_triangles(
 
 
 def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path) -> None:
-    gt = result.original_full
-    augmented = result.augmented_full
+    gt_full = result.original_full
+    gt = result.original_window
+    augmented = result.augmented_window
+
     gt_speed = speed_from_trajectory(gt)
     augmented_speed = speed_from_trajectory(augmented)
     gt_curvature = curvature_from_xy(gt.x, gt.y, cumulative_distance(gt.x, gt.y))
     augmented_curvature = curvature_from_xy(augmented.x, augmented.y, cumulative_distance(augmented.x, augmented.y))
 
-    current_idx = result.current_index
-    current_x = augmented.x[current_idx]
-    current_y = augmented.y[current_idx]
+    current_index_in_window = result.current_index - result.window_start_index
+    current_x = augmented.x[current_index_in_window]
+    current_y = augmented.y[current_index_in_window]
 
     future_merge_x, future_merge_y, _ = sample_centerline(
         result.future_segment.centerline,
@@ -557,9 +730,10 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
 
-    axes[0].plot(gt.x, gt.y, color="0.75", lw=2.0, label="GT full")
-    axes[0].plot(result.augmented_past.x, result.augmented_past.y, color="#2ca02c", lw=2.5, label="Augmented past")
-    axes[0].plot(result.augmented_future.x, result.augmented_future.y, color="#ff7f0e", lw=2.5, label="Augmented future")
+    axes[0].plot(gt_full.x, gt_full.y, color="0.88", lw=1.5, label="GT full context")
+    axes[0].plot(gt.x, gt.y, color="0.55", lw=2.0, label="GT window")
+    axes[0].plot(augmented.x[: current_index_in_window + 1], augmented.y[: current_index_in_window + 1], color="#2ca02c", lw=2.5, label="Augmented past")
+    axes[0].plot(augmented.x[current_index_in_window:], augmented.y[current_index_in_window:], color="#ff7f0e", lw=2.5, label="Augmented future")
     plot_pose_triangles(axes[0], gt.x, gt.y, gt.yaw, color="0.45", size=34, alpha=0.65, zorder=2.5)
     plot_pose_triangles(
         axes[0],
@@ -581,33 +755,40 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="best")
 
-    axes[1].plot(gt.t, gt_speed, color="0.55", lw=2.0, label="GT")
-    axes[1].plot(augmented.t, augmented_speed, color="#ff7f0e", lw=2.0, label="Augmented")
+    axes[1].plot(gt.t, gt_speed, color="0.55", lw=2.0, label="GT window")
+    axes[1].plot(augmented.t, augmented_speed, color="#ff7f0e", lw=2.0, label="Augmented window")
     axes[1].axvline(-result.past_connect_time_s, color="#1f77b4", ls="--", lw=1.2)
     axes[1].axvline(0.0, color="0.35", ls=":", lw=1.2)
     axes[1].axvline(result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
+    axes[1].set_xlim(gt.t[0], gt.t[-1])
     axes[1].set_title("Speed")
     axes[1].set_xlabel("time [s]")
     axes[1].set_ylabel("speed [m/s]")
     axes[1].grid(True, alpha=0.25)
     axes[1].legend(loc="best")
 
-    axes[2].plot(gt.t, gt_curvature, color="0.55", lw=2.0, label="GT")
-    axes[2].plot(augmented.t, augmented_curvature, color="#ff7f0e", lw=2.0, label="Augmented")
+    axes[2].plot(gt.t, gt_curvature, color="0.55", lw=2.0, label="GT window")
+    axes[2].plot(augmented.t, augmented_curvature, color="#ff7f0e", lw=2.0, label="Augmented window")
     axes[2].axvline(-result.past_connect_time_s, color="#1f77b4", ls="--", lw=1.2)
     axes[2].axvline(0.0, color="0.35", ls=":", lw=1.2)
     axes[2].axvline(result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
+    axes[2].set_xlim(gt.t[0], gt.t[-1])
     axes[2].set_title("Curvature")
     axes[2].set_xlabel("time [s]")
     axes[2].set_ylabel("curvature [1/m]")
     axes[2].grid(True, alpha=0.25)
     axes[2].legend(loc="best")
 
+    end_delta = np.linalg.norm(
+        np.array([augmented.x[-1] - gt.x[-1], augmented.y[-1] - gt.y[-1]])
+    )
     fig.suptitle(
         (
+            f"pattern={result.pattern_name}, "
             f"offset={result.lateral_offset_m:+.2f} m, "
             f"M={result.past_connect_time_s:.1f} s, "
-            f"N={result.future_recover_time_s:.1f} s"
+            f"N={result.future_recover_time_s:.1f} s, "
+            f"end_delta@8s={end_delta:.3f} m"
         ),
         fontsize=12,
     )
@@ -616,106 +797,16 @@ def make_demo_figure(result: BidirectionalAugmentationResult, output_path: Path)
     plt.close(fig)
 
 
-def make_sweep_trajectory_figure(
-    results_grid: list[list[BidirectionalAugmentationResult]],
-    offsets: list[float],
-    recover_times: list[float],
-    past_connect_time_s: float,
-    output_path: Path,
-) -> None:
-    time_window_start = -(past_connect_time_s + 0.5)
-    time_window_end = max(recover_times) + 0.5
-    all_x = []
-    all_y = []
-    for row in results_grid:
-        for result in row:
-            mask = (result.original_full.t >= time_window_start) & (result.original_full.t <= time_window_end)
-            all_x.extend([result.original_full.x[mask], result.augmented_full.x[mask]])
-            all_y.extend([result.original_full.y[mask], result.augmented_full.y[mask]])
-    x_min = min(np.min(v) for v in all_x) - 1.0
-    x_max = max(np.max(v) for v in all_x) + 1.0
-    y_min = min(np.min(v) for v in all_y) - 1.0
-    y_max = max(np.max(v) for v in all_y) + 1.0
-
-    fig, axes = plt.subplots(len(offsets), len(recover_times), figsize=(4.0 * len(recover_times), 2.9 * len(offsets)), sharex=True, sharey=True)
-    axes = np.atleast_2d(axes)
-
-    for row_idx, offset in enumerate(offsets):
-        for col_idx, recover_time in enumerate(recover_times):
-            ax = axes[row_idx, col_idx]
-            result = results_grid[row_idx][col_idx]
-            gt_mask = (result.original_full.t >= time_window_start) & (result.original_full.t <= time_window_end)
-            past_mask = result.augmented_past.t >= time_window_start
-            future_mask = result.augmented_future.t <= time_window_end
-            ax.plot(result.original_full.x[gt_mask], result.original_full.y[gt_mask], color="0.82", lw=1.8)
-            ax.plot(result.augmented_past.x[past_mask], result.augmented_past.y[past_mask], color="#2ca02c", lw=1.8)
-            ax.plot(result.augmented_future.x[future_mask], result.augmented_future.y[future_mask], color="#ff7f0e", lw=1.8)
-            ax.scatter(
-                result.augmented_full.x[result.current_index],
-                result.augmented_full.y[result.current_index],
-                color="#d62728",
-                s=18,
-            )
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_min, y_max)
-            ax.set_aspect("equal", adjustable="box")
-            ax.grid(True, alpha=0.20)
-            if row_idx == 0:
-                ax.set_title(f"N={recover_time:.1f}s")
-            if col_idx == 0:
-                ax.set_ylabel(f"d={offset:+.0f}m")
-            if row_idx == len(offsets) - 1:
-                ax.set_xlabel("x [m]")
-
-    fig.suptitle(f"Trajectory Sweep (past bridge M={past_connect_time_s:.1f} s)", fontsize=13)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-
-
-def make_sweep_speed_figure(
-    results_grid: list[list[BidirectionalAugmentationResult]],
-    offsets: list[float],
-    recover_times: list[float],
-    past_connect_time_s: float,
-    output_path: Path,
-) -> None:
-    fig, axes = plt.subplots(len(offsets), len(recover_times), figsize=(4.0 * len(recover_times), 2.5 * len(offsets)), sharex=True, sharey=True)
-    axes = np.atleast_2d(axes)
-
-    for row_idx, offset in enumerate(offsets):
-        for col_idx, recover_time in enumerate(recover_times):
-            ax = axes[row_idx, col_idx]
-            result = results_grid[row_idx][col_idx]
-            gt_speed = speed_from_trajectory(result.original_full)
-            augmented_speed = speed_from_trajectory(result.augmented_full)
-            ax.plot(result.original_full.t, gt_speed, color="0.65", lw=1.6)
-            ax.plot(result.augmented_full.t, augmented_speed, color="#ff7f0e", lw=1.8)
-            ax.axvline(-past_connect_time_s, color="#1f77b4", ls="--", lw=0.9)
-            ax.axvline(0.0, color="0.35", ls=":", lw=0.9)
-            ax.axvline(recover_time, color="#9467bd", ls="--", lw=0.9)
-            ax.grid(True, alpha=0.20)
-            if row_idx == 0:
-                ax.set_title(f"N={recover_time:.1f}s")
-            if col_idx == 0:
-                ax.set_ylabel(f"d={offset:+.0f}m")
-            if row_idx == len(offsets) - 1:
-                ax.set_xlabel("time [s]")
-
-    fig.suptitle(f"Speed Sweep (past bridge M={past_connect_time_s:.1f} s)", fontsize=13)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-
-
 def run_demo(
+    pattern_name: str,
+    pattern_dir: Path,
     seed: int,
     output_path: Path,
     offset_m: float | None,
     recover_time_s: float,
     past_connect_time_s: float,
 ) -> BidirectionalAugmentationResult:
-    gt, current_index = generate_synthetic_gt()
+    gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
     rng = np.random.default_rng(seed)
     lateral_offset_m = offset_m if offset_m is not None else sample_random_lateral_offset(rng)
     result = augment_trajectory_bidirectional(
@@ -724,19 +815,26 @@ def run_demo(
         lateral_offset_m=lateral_offset_m,
         future_recover_time_s=recover_time_s,
         past_connect_time_s=past_connect_time_s,
+        output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
+        output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
+        pattern_name=pattern_name,
     )
     make_demo_figure(result, output_path=output_path)
     return result
 
 
 def run_sweep(
+    pattern_name: str,
+    pattern_dir: Path,
     output_prefix: Path,
     offsets: list[float],
     recover_times: list[float],
     past_connect_times: list[float],
 ) -> list[Path]:
-    gt, current_index = generate_synthetic_gt()
+    gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
     output_paths: list[Path] = []
+    pattern_suffix = f"_{pattern_name}"
+
     for past_connect_time_s in past_connect_times:
         for offset in offsets:
             for recover_time in recover_times:
@@ -746,9 +844,13 @@ def run_sweep(
                     lateral_offset_m=offset,
                     future_recover_time_s=recover_time,
                     past_connect_time_s=past_connect_time_s,
+                    output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
+                    output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
+                    pattern_name=pattern_name,
                 )
                 suffix = (
-                    format_offset_suffix(offset)
+                    pattern_suffix
+                    + format_offset_suffix(offset)
                     + format_time_suffix("N", recover_time)
                     + format_time_suffix("M", past_connect_time_s)
                 )
@@ -761,10 +863,14 @@ def run_sweep(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Diffusion Planner data augmentation demo.")
+    parser.add_argument("--pattern", type=str, default=DEFAULT_PATTERN_NAME)
+    parser.add_argument("--pattern-dir", type=Path, default=DEFAULT_PATTERN_DIR)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--recover-time", type=float, default=1.5)
     parser.add_argument("--past-connect-time", type=float, default=1.0)
     parser.add_argument("--offset", type=float, default=None)
+    parser.add_argument("--write-pattern-csvs", action="store_true", help="Generate the CSV test patterns and exit.")
+    parser.add_argument("--list-patterns", action="store_true", help="List available pattern names and exit.")
     parser.add_argument(
         "--output",
         type=Path,
@@ -780,23 +886,37 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.list_patterns:
+        for pattern_name in list_pattern_names():
+            print(pattern_name)
+        return
+
+    if args.write_pattern_csvs:
+        output_paths = write_test_pattern_csvs(args.pattern_dir)
+        print(f"Wrote {len(output_paths)} pattern CSV files to: {args.pattern_dir}")
+        return
+
     if args.sweep:
         offsets = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
         recover_times = [0.5, 1.0, 1.5, 2.0]
         past_connect_times = [0.5, 1.0, 1.5, 2.0]
         output_paths = run_sweep(
+            pattern_name=args.pattern,
+            pattern_dir=args.pattern_dir,
             output_prefix=args.output_prefix,
             offsets=offsets,
             recover_times=recover_times,
             past_connect_times=past_connect_times,
         )
-        print(f"Saved {len(output_paths)} sweep images.")
+        print(f"Saved {len(output_paths)} sweep images for pattern: {args.pattern}")
         if output_paths:
             print(f"First image: {output_paths[0]}")
             print(f"Last image: {output_paths[-1]}")
         return
 
     result = run_demo(
+        pattern_name=args.pattern,
+        pattern_dir=args.pattern_dir,
         seed=args.seed,
         output_path=args.output,
         offset_m=args.offset,
@@ -804,23 +924,39 @@ def main() -> None:
         past_connect_time_s=args.past_connect_time,
     )
 
-    gt_speed = speed_from_trajectory(result.original_full)
-    augmented_speed = speed_from_trajectory(result.augmented_full)
+    gt_speed = speed_from_trajectory(result.original_window)
+    augmented_speed = speed_from_trajectory(result.augmented_window)
     speed_margin = float(np.max(augmented_speed - gt_speed))
     curvature = curvature_from_xy(
-        result.augmented_full.x,
-        result.augmented_full.y,
-        cumulative_distance(result.augmented_full.x, result.augmented_full.y),
+        result.augmented_window.x,
+        result.augmented_window.y,
+        cumulative_distance(result.augmented_window.x, result.augmented_window.y),
+    )
+    end_delta = float(
+        np.linalg.norm(
+            np.array(
+                [
+                    result.augmented_window.x[-1] - result.original_window.x[-1],
+                    result.augmented_window.y[-1] - result.original_window.y[-1],
+                ]
+            )
+        )
     )
 
     print(f"Saved visualization to: {args.output}")
+    print(f"Pattern: {result.pattern_name}")
+    print(
+        f"Full GT horizon: past {FULL_PAST_HORIZON_S:.1f}s / future {FULL_FUTURE_HORIZON_S:.1f}s, "
+        f"augmented output window: past {OUTPUT_PAST_HORIZON_S:.1f}s / future {OUTPUT_FUTURE_HORIZON_S:.1f}s"
+    )
     print(f"Lateral offset: {result.lateral_offset_m:+.3f} m")
     print(f"Past bridge M: {result.past_connect_time_s:.2f} s")
     print(f"Future bridge N: {result.future_recover_time_s:.2f} s")
     print(f"Past speed scale: {result.past_segment.connect_speed_scale:.3f}")
     print(f"Future speed scale: {result.future_segment.connect_speed_scale:.3f}")
-    print(f"Max speed margin vs GT: {speed_margin:.3f} m/s")
-    print(f"Max |curvature|: {float(np.max(np.abs(curvature))):.4f} 1/m")
+    print(f"Max speed margin vs GT in output window: {speed_margin:.3f} m/s")
+    print(f"End delta at +8s: {end_delta:.3f} m")
+    print(f"Max |curvature| in output window: {float(np.max(np.abs(curvature))):.4f} 1/m")
 
 
 if __name__ == "__main__":
