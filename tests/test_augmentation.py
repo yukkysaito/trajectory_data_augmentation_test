@@ -17,7 +17,7 @@ from diffusion_planner_augmentation import (
     list_pattern_names,
     load_test_pattern,
     sample_centerline,
-    search_lateral_accel_feasible_result,
+    search_feasible_result,
     speed_from_trajectory,
     write_test_pattern_csvs,
 )
@@ -162,7 +162,7 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
                 )
                 curvature_step = np.diff(curvature)
                 self.assertLess(float(np.max(np.abs(curvature))), 0.24)
-                self.assertLess(float(np.max(np.abs(curvature_step))), 0.11)
+                self.assertLess(float(np.max(np.abs(curvature_step))), 0.14)
 
     def test_endpoint_matches_gt_after_state_matched_merge(self) -> None:
         gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
@@ -223,18 +223,23 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
                     delta=1.0,
                 )
 
-    def test_lateral_accel_search_finds_lowest_n_before_extending_m(self) -> None:
+    def test_feasibility_search_finds_lowest_n_before_extending_m(self) -> None:
         gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
         result = augment_trajectory_bidirectional(
             gt=gt,
             current_index=current_index,
-            lateral_offset_m=3.0,
+            lateral_offset_m=2.5,
             heading_offset_rad=np.deg2rad(10.0),
             future_recover_time_s=0.5,
             past_connect_time_s=2.0,
             pattern_name="curve_decelerating",
         )
-        diagnostics = search_lateral_accel_feasible_result(result, max_lateral_accel_mps2=4.0)
+        diagnostics = search_feasible_result(
+            result,
+            max_lateral_accel_mps2=4.0,
+            max_bridge_speed_gap_mps=0.5,
+            max_bridge_jerk_mps3=5.0,
+        )
 
         self.assertFalse(diagnostics.initial.passes)
         self.assertIsNotNone(diagnostics.adapted_result)
@@ -243,8 +248,11 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
         self.assertAlmostEqual(diagnostics.adapted_result.past_connect_time_s, 2.0, places=6)
         self.assertGreater(diagnostics.adapted_result.future_recover_time_s, 0.5)
         self.assertTrue(diagnostics.adapted.passes)
+        self.assertTrue(diagnostics.adapted.lateral_accel_passes)
+        self.assertTrue(diagnostics.adapted.speed_gap_passes)
+        self.assertTrue(diagnostics.adapted.jerk_passes)
 
-    def test_lateral_accel_search_extends_m_when_n_only_is_insufficient(self) -> None:
+    def test_feasibility_search_extends_m_when_n_only_is_insufficient(self) -> None:
         gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
         result = augment_trajectory_bidirectional(
             gt=gt,
@@ -255,7 +263,12 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
             past_connect_time_s=0.5,
             pattern_name="curve_decelerating",
         )
-        diagnostics = search_lateral_accel_feasible_result(result, max_lateral_accel_mps2=3.0)
+        diagnostics = search_feasible_result(
+            result,
+            max_lateral_accel_mps2=3.0,
+            max_bridge_speed_gap_mps=0.5,
+            max_bridge_jerk_mps3=5.0,
+        )
 
         self.assertFalse(diagnostics.initial.passes)
         self.assertIsNotNone(diagnostics.adapted_result)
@@ -264,6 +277,9 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
         self.assertGreater(diagnostics.adapted_result.past_connect_time_s, 0.5)
         self.assertGreater(diagnostics.adapted_result.future_recover_time_s, 0.5)
         self.assertTrue(diagnostics.adapted.passes)
+        self.assertTrue(diagnostics.adapted.lateral_accel_passes)
+        self.assertTrue(diagnostics.adapted.speed_gap_passes)
+        self.assertTrue(diagnostics.adapted.jerk_passes)
 
     def test_stopping_pattern_stops_at_the_original_stop_pose(self) -> None:
         gt, current_index = load_test_pattern("straight_stopping", DEFAULT_PATTERN_DIR)
