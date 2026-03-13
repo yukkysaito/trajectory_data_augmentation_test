@@ -46,24 +46,26 @@ and these speed profiles:
 - `decelerating`
 - `accelerating`
 - `stopping`
+- `stop8s`
 
-This gives 12 combinations in total, for example:
+This gives 15 combinations in total, for example:
 
 - `straight_constant.csv`
 - `curve_decelerating.csv`
 - `s_curve_accelerating.csv`
 - `straight_stopping.csv`
+- `straight_stop8s.csv`
 
 ## Main Idea
 
 The GT trajectory is treated as a centerline. The augmented path is constructed in a Frenet-like manner:
 
-- the lateral offset is generated with a monotonic time-polynomial bridge
-- the bridge is state-matched to the GT at the merge time
-- after the merge time, the augmented trajectory copies the original GT exactly
+- the lateral offset is generated with a monotonic quintic bridge along the GT centerline
+- the bridge is merged to an earlier point on the GT centerline if needed so that no catch-up acceleration is required
+- after the merge time, the augmented trajectory follows the GT speed as a function of centerline progress, so a longer bridge naturally appears as a delayed speed profile in time
 - the same logic is applied backward in time for the past bridge
 
-This keeps the path smooth while preserving continuity at `t0` and exact GT tracking after the merge.
+This keeps the path smooth while avoiding forced catch-up after the bridge. If the augmented path is longer, the vehicle stays behind in progress instead of accelerating to match the GT at the same absolute timestamp.
 
 ## Bridge Feasibility
 
@@ -190,18 +192,19 @@ python3 -m unittest discover -s tests -v
 
 The test suite checks:
 
-- all 12 CSV patterns can be generated and loaded
+- all 15 CSV patterns can be generated and loaded
 - the full GT horizon is `[-5 s, +10 s]`
 - the output window is `[-3 s, +8 s]`
-- the augmented future matches the GT exactly after the merge time
+- the augmented future follows GT speed at the corresponding centerline progress after the merge time
 - recovery pose consistency with the intended merge point
 - continuity at `t0`
 - bounded curvature and curvature variation
-- exact endpoint agreement at `+8 s` after state-matched merge
+- endpoint lag at `+8 s` for representative large-offset cases
 - composite feasibility search for both the `N-only` and `(M, N)` fallback paths
-- stopping-pattern behavior
+- stopping-pattern behavior under progress-based speed matching
 
 ## Notes
 
 - The feasibility search currently uses sampled trajectory kinematics inside the bridge windows rather than a full vehicle model.
-- Low-speed or stopping patterns are supported as synthetic test cases, but no steering-rate or tire-force limits are modeled yet.
+- Low-speed or stopping patterns are supported as synthetic test cases, but if the GT fully stops within the output horizon, preserving the GT speed profile can leave the augmented stop pose short of the original stop point.
+- No steering-rate or tire-force limits are modeled yet.
