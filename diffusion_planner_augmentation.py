@@ -22,7 +22,7 @@ DEFAULT_DT = 0.1
 MIN_BRIDGE_TIME_S = 0.1
 
 SHAPE_NAMES = ("straight", "curve", "s_curve")
-SPEED_PROFILE_NAMES = ("constant", "decelerating", "accelerating")
+SPEED_PROFILE_NAMES = ("constant", "decelerating", "accelerating", "stopping")
 
 DEFAULT_PATTERN_NAME = "s_curve_constant"
 DEFAULT_PATTERN_DIR = Path(__file__).resolve().parent / "test_patterns"
@@ -222,6 +222,68 @@ def smoothstep(unit_value: np.ndarray) -> np.ndarray:
     return 3.0 * u**2 - 2.0 * u**3
 
 
+def solve_quintic_time_coeffs(
+    duration_s: float,
+    start_value: float,
+    start_velocity: float,
+    start_acceleration: float,
+    end_value: float,
+    end_velocity: float,
+    end_acceleration: float,
+) -> np.ndarray:
+    if duration_s <= 0.0:
+        raise ValueError("duration_s must be positive.")
+
+    T = float(duration_s)
+    a0 = float(start_value)
+    a1 = float(start_velocity)
+    a2 = 0.5 * float(start_acceleration)
+    system = np.array(
+        [
+            [T**3, T**4, T**5],
+            [3.0 * T**2, 4.0 * T**3, 5.0 * T**4],
+            [6.0 * T, 12.0 * T**2, 20.0 * T**3],
+        ],
+        dtype=float,
+    )
+    rhs = np.array(
+        [
+            end_value - (a0 + a1 * T + a2 * T**2),
+            end_velocity - (a1 + 2.0 * a2 * T),
+            end_acceleration - (2.0 * a2),
+        ],
+        dtype=float,
+    )
+    a3, a4, a5 = np.linalg.solve(system, rhs)
+    return np.array([a0, a1, a2, a3, a4, a5], dtype=float)
+
+
+def evaluate_quintic_time_profile(coeffs: np.ndarray, time_s: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    t = np.asarray(time_s, dtype=float)
+    value = (
+        coeffs[0]
+        + coeffs[1] * t
+        + coeffs[2] * t**2
+        + coeffs[3] * t**3
+        + coeffs[4] * t**4
+        + coeffs[5] * t**5
+    )
+    velocity = (
+        coeffs[1]
+        + 2.0 * coeffs[2] * t
+        + 3.0 * coeffs[3] * t**2
+        + 4.0 * coeffs[4] * t**3
+        + 5.0 * coeffs[5] * t**4
+    )
+    acceleration = (
+        2.0 * coeffs[2]
+        + 6.0 * coeffs[3] * t
+        + 12.0 * coeffs[4] * t**2
+        + 20.0 * coeffs[5] * t**3
+    )
+    return value, velocity, acceleration
+
+
 def split_pattern_name(pattern_name: str) -> tuple[str, str]:
     if "_" not in pattern_name:
         raise ValueError(f"Invalid pattern name: {pattern_name}")
@@ -246,9 +308,16 @@ def build_speed_profile(times: np.ndarray, speed_profile_name: str) -> np.ndarra
         speed = 10.0 - 4.0 * blend
     elif speed_profile_name == "accelerating":
         speed = 6.0 + 4.0 * blend
+    elif speed_profile_name == "stopping":
+        speed = np.full_like(times, 8.0, dtype=float)
+        stop_time_s = 5.0
+        future_blend = smoothstep(np.clip(times / stop_time_s, 0.0, 1.0))
+        future_mask = times > 0.0
+        speed[future_mask] = 8.0 * (1.0 - future_blend[future_mask])
+        speed[times >= stop_time_s] = 0.0
     else:
         raise ValueError(f"Unsupported speed profile: {speed_profile_name}")
-    return np.clip(speed, 3.0, None)
+    return np.clip(speed, 0.0, None)
 
 
 def build_curvature_profile(s_rel: np.ndarray, shape_name: str) -> np.ndarray:
@@ -374,11 +443,20 @@ def load_test_pattern(
 
 def build_centerline(segment: Trajectory2D, dense_ds: float = 0.05) -> Centerline:
     s_samples = cumulative_distance(segment.x, segment.y)
-    dense_s = np.arange(0.0, s_samples[-1] + dense_ds * 0.5, dense_ds)
-    yaw_samples = np.unwrap(segment.yaw)
-    dense_x = np.interp(dense_s, s_samples, segment.x)
-    dense_y = np.interp(dense_s, s_samples, segment.y)
-    dense_yaw = np.interp(dense_s, s_samples, yaw_samples)
+    unique_s, unique_indices = np.unique(s_samples, return_index=True)
+    x_samples = segment.x[unique_indices]
+    y_samples = segment.y[unique_indices]
+    yaw_samples = np.unwrap(segment.yaw[unique_indices])
+    if len(unique_s) == 1:
+        dense_s = unique_s.copy()
+        dense_x = x_samples.copy()
+        dense_y = y_samples.copy()
+        dense_yaw = yaw_samples.copy()
+    else:
+        dense_s = np.arange(0.0, unique_s[-1] + dense_ds * 0.5, dense_ds)
+        dense_x = np.interp(dense_s, unique_s, x_samples)
+        dense_y = np.interp(dense_s, unique_s, y_samples)
+        dense_yaw = np.interp(dense_s, unique_s, yaw_samples)
     return Centerline(s=dense_s, x=dense_x, y=dense_y, yaw=dense_yaw)
 
 
@@ -619,51 +697,81 @@ def augment_directed_segment(
 
     centerline = build_centerline(segment, dense_ds=dense_ds)
     distance_profile = cumulative_distance(segment.x, segment.y)
-    total_distance_m = distance_profile[-1]
+    speed_profile = speed_from_progress(distance_profile, segment.t)
+    acceleration_profile = np.gradient(speed_profile, strictly_increasing_param(segment.t), edge_order=2)
+    curvature_profile = curvature_from_xy(segment.x, segment.y, distance_profile)
 
     connect_budget_m = float(np.interp(connect_time_s, segment.t, distance_profile))
-    s_merge, merge_path, connect_speed_scale = plan_recovery_path(
-        centerline=centerline,
-        distance_budget_m=connect_budget_m,
-        lateral_offset_m=lateral_offset_m,
-        heading_offset_rad=heading_offset_rad,
-        dense_ds=dense_ds,
-    )
+    end_speed = float(np.interp(connect_time_s, segment.t, speed_profile))
+    end_acceleration = float(np.interp(connect_time_s, segment.t, acceleration_profile))
 
-    dense_full_path = build_full_augmented_path(
-        centerline=centerline,
-        merge_path=merge_path,
-        s_merge=s_merge,
-        connect_budget_m=connect_budget_m,
-        total_distance_m=total_distance_m,
-        dense_ds=dense_ds,
+    start_speed = float(speed_profile[0])
+    start_acceleration = float(acceleration_profile[0])
+    start_curvature = float(curvature_profile[0]) if len(curvature_profile) > 0 else 0.0
+    denom = max(1.0 - start_curvature * lateral_offset_m, 1.0e-3)
+    start_s_velocity = start_speed * np.cos(heading_offset_rad) / denom
+    start_l_velocity = start_speed * np.sin(heading_offset_rad)
+
+    s_coeffs = solve_quintic_time_coeffs(
+        duration_s=connect_time_s,
+        start_value=0.0,
+        start_velocity=start_s_velocity,
+        start_acceleration=start_acceleration,
+        end_value=connect_budget_m,
+        end_velocity=end_speed,
+        end_acceleration=end_acceleration,
+    )
+    l_coeffs = solve_quintic_time_coeffs(
+        duration_s=connect_time_s,
+        start_value=lateral_offset_m,
+        start_velocity=start_l_velocity,
+        start_acceleration=0.0,
+        end_value=0.0,
+        end_velocity=0.0,
+        end_acceleration=0.0,
     )
 
     connect_mask = segment.t <= connect_time_s + 1.0e-9
     query_x = np.zeros_like(segment.x)
     query_y = np.zeros_like(segment.y)
-    progress_profile = np.zeros_like(segment.t)
+    bridge_time = segment.t[connect_mask]
+    bridge_s, _, _ = evaluate_quintic_time_profile(s_coeffs, bridge_time)
+    bridge_l, _, _ = evaluate_quintic_time_profile(l_coeffs, bridge_time)
+    bridge_s = np.clip(bridge_s, centerline.s[0], centerline.s[-1])
 
-    connect_sigma = connect_speed_scale * distance_profile[connect_mask]
-    query_x[connect_mask] = np.interp(connect_sigma, merge_path.sigma, merge_path.x)
-    query_y[connect_mask] = np.interp(connect_sigma, merge_path.sigma, merge_path.y)
-    progress_profile[connect_mask] = connect_sigma
+    base_x, base_y, base_yaw = sample_centerline(centerline, bridge_s)
+    normal_x = -np.sin(base_yaw)
+    normal_y = np.cos(base_yaw)
+    query_x[connect_mask] = base_x + bridge_l * normal_x
+    query_y[connect_mask] = base_y + bridge_l * normal_y
 
     continue_mask = ~connect_mask
     if np.any(continue_mask):
-        continue_s = s_merge + (distance_profile[continue_mask] - connect_budget_m)
-        cont_x, cont_y, _ = sample_centerline(centerline, continue_s)
-        query_x[continue_mask] = cont_x
-        query_y[continue_mask] = cont_y
-        progress_profile[continue_mask] = merge_path.sigma[-1] + (distance_profile[continue_mask] - connect_budget_m)
+        query_x[continue_mask] = segment.x[continue_mask]
+        query_y[continue_mask] = segment.y[continue_mask]
 
     directional_yaw = compute_forward_yaw(query_x, query_y, fallback_yaw=segment.yaw)
+    progress_profile = cumulative_distance(query_x, query_y)
     augmented_segment = Trajectory2D(
         t=segment.t.copy(),
         x=query_x,
         y=query_y,
         yaw=directional_yaw,
     )
+
+    merge_path = DensePath(
+        sigma=progress_profile[connect_mask],
+        x=query_x[connect_mask].copy(),
+        y=query_y[connect_mask].copy(),
+        yaw=directional_yaw[connect_mask].copy(),
+    )
+    dense_full_path = DensePath(
+        sigma=progress_profile.copy(),
+        x=query_x.copy(),
+        y=query_y.copy(),
+        yaw=directional_yaw.copy(),
+    )
+    merge_path_length_m = float(merge_path.sigma[-1]) if len(merge_path.sigma) > 0 else 0.0
 
     return SegmentAugmentationResult(
         original_segment=segment,
@@ -673,10 +781,10 @@ def augment_directed_segment(
         distance_profile=distance_profile,
         progress_profile=progress_profile,
         connect_time_s=connect_time_s,
-        merge_centerline_s=s_merge,
-        merge_path_length_m=merge_path.sigma[-1],
+        merge_centerline_s=connect_budget_m,
+        merge_path_length_m=merge_path_length_m,
         connect_distance_budget_m=connect_budget_m,
-        connect_speed_scale=connect_speed_scale,
+        connect_speed_scale=1.0,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
     )

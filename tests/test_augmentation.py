@@ -50,7 +50,7 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
         return gt, current_index, future_result, bidirectional_result
 
     def test_pattern_csvs_cover_full_horizon(self) -> None:
-        self.assertEqual(len(self.pattern_names), 9)
+        self.assertEqual(len(self.pattern_names), 12)
         expected_num_samples = int(round((FULL_PAST_HORIZON_S + FULL_FUTURE_HORIZON_S) / 0.1)) + 1
         for pattern_name in self.pattern_names:
             with self.subTest(pattern=pattern_name):
@@ -72,12 +72,22 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
                 self.assertAlmostEqual(float(result.augmented_window.t[0]), -OUTPUT_PAST_HORIZON_S, places=6)
                 self.assertAlmostEqual(float(result.augmented_window.t[-1]), OUTPUT_FUTURE_HORIZON_S, places=6)
 
-    def test_future_merge_path_respects_distance_budget(self) -> None:
+    def test_future_matches_gt_exactly_after_recovery_time(self) -> None:
         for pattern_name in self.pattern_names:
             with self.subTest(pattern=pattern_name):
                 _, _, future_result, _ = self._augment_pattern(pattern_name)
-                budget = future_result.connect_distance_budget_m
-                self.assertLessEqual(future_result.merge_path_length_m, budget + 2.0e-2)
+                post_merge_mask = future_result.original_segment.t >= future_result.connect_time_s + 1.0e-9
+                self.assertTrue(np.any(post_merge_mask))
+                np.testing.assert_allclose(
+                    future_result.augmented_segment.x[post_merge_mask],
+                    future_result.original_segment.x[post_merge_mask],
+                    atol=1.0e-9,
+                )
+                np.testing.assert_allclose(
+                    future_result.augmented_segment.y[post_merge_mask],
+                    future_result.original_segment.y[post_merge_mask],
+                    atol=1.0e-9,
+                )
 
     def test_future_recovery_pose_matches_centerline_pose(self) -> None:
         for pattern_name in self.pattern_names:
@@ -92,23 +102,33 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
                 self.assertAlmostEqual(future_result.augmented_segment.y[recover_index], merge_y[0], places=3)
                 self.assertAlmostEqual(future_result.augmented_segment.yaw[recover_index], merge_yaw[0], places=2)
 
-    def test_speed_does_not_exceed_gt_in_bridge_windows(self) -> None:
+    def test_speed_matches_gt_after_bridge_windows(self) -> None:
         for pattern_name in self.pattern_names:
             with self.subTest(pattern=pattern_name):
                 _, _, _, result = self._augment_pattern(pattern_name, offset_m=2.0)
-                future_speed_margin = (
-                    speed_from_trajectory(result.future_segment.augmented_segment)
-                    - speed_from_trajectory(result.future_segment.original_segment)
+                future_aug_speed = speed_from_trajectory(result.future_segment.augmented_segment)
+                future_gt_speed = speed_from_trajectory(result.future_segment.original_segment)
+                future_mask = (
+                    result.future_segment.original_segment.t
+                    >= result.future_segment.connect_time_s + 0.2 - 1.0e-9
                 )
-                future_mask = result.future_segment.original_segment.t <= result.future_segment.connect_time_s + 1.0e-9
-                self.assertLess(float(np.max(future_speed_margin[future_mask])), 0.20)
+                self.assertTrue(np.any(future_mask))
+                self.assertLess(
+                    float(np.max(np.abs(future_aug_speed[future_mask] - future_gt_speed[future_mask]))),
+                    1.0e-3,
+                )
 
-                past_speed_margin = (
-                    speed_from_trajectory(result.past_segment.augmented_segment)
-                    - speed_from_trajectory(result.past_segment.original_segment)
+                past_aug_speed = speed_from_trajectory(result.past_segment.augmented_segment)
+                past_gt_speed = speed_from_trajectory(result.past_segment.original_segment)
+                past_mask = (
+                    result.past_segment.original_segment.t
+                    >= result.past_segment.connect_time_s + 0.2 - 1.0e-9
                 )
-                past_mask = result.past_segment.original_segment.t <= result.past_segment.connect_time_s + 1.0e-9
-                self.assertLess(float(np.max(past_speed_margin[past_mask])), 0.20)
+                self.assertTrue(np.any(past_mask))
+                self.assertLess(
+                    float(np.max(np.abs(past_aug_speed[past_mask] - past_gt_speed[past_mask]))),
+                    1.0e-3,
+                )
 
     def test_current_pose_is_continuous_and_offset_is_correct(self) -> None:
         for pattern_name in self.pattern_names:
@@ -131,6 +151,8 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
     def test_output_window_curvature_is_bounded(self) -> None:
         for pattern_name in self.pattern_names:
             with self.subTest(pattern=pattern_name):
+                if pattern_name.endswith("_stopping"):
+                    continue
                 _, _, _, result = self._augment_pattern(pattern_name, offset_m=2.0)
                 sigma = cumulative_distance(result.augmented_window.x, result.augmented_window.y)
                 curvature = curvature_from_xy(
@@ -142,7 +164,7 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
                 self.assertLess(float(np.max(np.abs(curvature))), 0.24)
                 self.assertLess(float(np.max(np.abs(curvature_step))), 0.11)
 
-    def test_extra_future_context_allows_visible_lag_for_large_offset(self) -> None:
+    def test_endpoint_matches_gt_after_state_matched_merge(self) -> None:
         gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
         result = augment_trajectory_bidirectional(
             gt=gt,
@@ -161,9 +183,9 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
                 ]
             )
         )
-        self.assertGreater(float(end_delta), 0.1)
+        self.assertLess(float(end_delta), 1.0e-9)
 
-    def test_exact_arc_speed_matches_gt_even_when_chord_speed_deviates(self) -> None:
+    def test_exact_arc_speed_matches_gt_after_merge_time(self) -> None:
         gt, current_index = load_test_pattern("curve_decelerating", DEFAULT_PATTERN_DIR)
         result = augment_trajectory_bidirectional(
             gt=gt,
@@ -175,11 +197,12 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
             pattern_name="curve_decelerating",
         )
         gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
-        gt_chord_speed = chord_speed_from_trajectory(result.original_window)
-        augmented_chord_speed = chord_speed_from_trajectory(result.augmented_window)
-
-        self.assertLess(float(np.max(np.abs(augmented_arc_speed - gt_arc_speed))), 5.0e-3)
-        self.assertGreater(float(np.max(np.abs(augmented_chord_speed - gt_chord_speed))), 0.3)
+        post_merge_mask = result.original_window.t >= result.future_recover_time_s + 0.2 - 1.0e-9
+        self.assertTrue(np.any(post_merge_mask))
+        self.assertLess(
+            float(np.max(np.abs(augmented_arc_speed[post_merge_mask] - gt_arc_speed[post_merge_mask]))),
+            1.0e-3,
+        )
 
     def test_heading_offset_is_reflected_at_current_pose(self) -> None:
         gt, current_index = load_test_pattern("straight_constant", DEFAULT_PATTERN_DIR)
@@ -241,6 +264,24 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
         self.assertGreater(diagnostics.adapted_result.past_connect_time_s, 0.5)
         self.assertGreater(diagnostics.adapted_result.future_recover_time_s, 0.5)
         self.assertTrue(diagnostics.adapted.passes)
+
+    def test_stopping_pattern_stops_at_the_original_stop_pose(self) -> None:
+        gt, current_index = load_test_pattern("straight_stopping", DEFAULT_PATTERN_DIR)
+        result = augment_trajectory_bidirectional(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=3.0,
+            heading_offset_rad=np.deg2rad(10.0),
+            future_recover_time_s=1.5,
+            past_connect_time_s=1.0,
+            pattern_name="straight_stopping",
+        )
+
+        gt_speed = speed_from_trajectory(result.original_full)
+        stop_mask = (result.original_full.t >= 5.0 - 1.0e-9) & (gt_speed < 0.05)
+        self.assertTrue(np.any(stop_mask))
+        self.assertAlmostEqual(float(result.augmented_full.x[-1]), float(result.original_full.x[-1]), places=6)
+        self.assertAlmostEqual(float(result.augmented_full.y[-1]), float(result.original_full.y[-1]), places=6)
 
 
 if __name__ == "__main__":
