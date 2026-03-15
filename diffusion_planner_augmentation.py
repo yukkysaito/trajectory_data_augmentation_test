@@ -22,7 +22,7 @@ DEFAULT_DT = 0.1
 MIN_BRIDGE_TIME_S = 0.1
 
 SHAPE_NAMES = ("straight", "curve", "s_curve")
-SPEED_PROFILE_NAMES = ("constant", "decelerating", "accelerating")
+SPEED_PROFILE_NAMES = ("constant", "decelerating", "accelerating", "stopping", "stop8s")
 
 DEFAULT_PATTERN_NAME = "s_curve_constant"
 DEFAULT_PATTERN_DIR = Path(__file__).resolve().parent / "test_patterns"
@@ -68,6 +68,7 @@ class SegmentAugmentationResult:
     dense_augmented_path: DensePath
     distance_profile: np.ndarray
     progress_profile: np.ndarray
+    exact_speed_profile: np.ndarray
     connect_time_s: float
     merge_centerline_s: float
     merge_path_length_m: float
@@ -100,20 +101,33 @@ class BidirectionalAugmentationResult:
 
 
 @dataclass
-class LateralAccelDiagnostics:
-    limit_mps2: float
+class ConstraintDiagnostics:
     time: np.ndarray
+    bridge_mask: np.ndarray
+    lateral_accel_limit_mps2: float
+    speed_gap_limit_mps: float
+    jerk_limit_mps3: float
     gt_lateral_accel_mps2: np.ndarray
     augmented_lateral_accel_mps2: np.ndarray
     max_abs_augmented_lateral_accel_mps2: float
+    gt_arc_speed_mps: np.ndarray
+    augmented_arc_speed_mps: np.ndarray
+    bridge_speed_gap_mps: np.ndarray
+    max_bridge_speed_gap_mps: float
+    gt_longitudinal_jerk_mps3: np.ndarray
+    augmented_longitudinal_jerk_mps3: np.ndarray
+    max_abs_bridge_jerk_mps3: float
+    lateral_accel_passes: bool
+    speed_gap_passes: bool
+    jerk_passes: bool
     passes: bool
 
 
 @dataclass
 class FeasibilitySearchDiagnostics:
-    initial: LateralAccelDiagnostics
+    initial: ConstraintDiagnostics
     adapted_result: BidirectionalAugmentationResult | None
-    adapted: LateralAccelDiagnostics | None
+    adapted: ConstraintDiagnostics | None
     adaptation_strategy: str | None
 
 
@@ -195,6 +209,66 @@ def speed_from_progress(progress: np.ndarray, time: np.ndarray) -> np.ndarray:
     return np.gradient(progress, strictly_increasing_param(time), edge_order=2)
 
 
+def build_progress_speed_lookup(progress: np.ndarray, speed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    progress = np.asarray(progress, dtype=float)
+    speed = np.clip(np.asarray(speed, dtype=float), 0.0, None)
+    unique_progress, inverse = np.unique(progress, return_inverse=True)
+    lookup_speed = np.zeros_like(unique_progress, dtype=float)
+    for idx in range(len(unique_progress)):
+        lookup_speed[idx] = float(np.min(speed[inverse == idx]))
+    return unique_progress, lookup_speed
+
+
+def build_progress_time_lookup(progress: np.ndarray, time: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    progress = np.asarray(progress, dtype=float)
+    time = np.asarray(time, dtype=float)
+    unique_progress, first_indices = np.unique(progress, return_index=True)
+    return unique_progress, time[first_indices]
+
+
+def sample_speed_by_progress(progress_samples: np.ndarray, speed_samples: np.ndarray, progress_query: np.ndarray) -> np.ndarray:
+    clamped_progress = np.clip(progress_query, progress_samples[0], progress_samples[-1])
+    return np.interp(clamped_progress, progress_samples, speed_samples)
+
+
+def integrate_progress_with_speed_lookup(
+    time: np.ndarray,
+    start_progress: float,
+    progress_samples: np.ndarray,
+    speed_samples: np.ndarray,
+    max_progress: float,
+) -> np.ndarray:
+    integrated = np.zeros_like(time, dtype=float)
+    if len(time) == 0:
+        return integrated
+
+    integrated[0] = float(start_progress)
+    for idx in range(1, len(time)):
+        dt = float(time[idx] - time[idx - 1])
+        prev_progress = integrated[idx - 1]
+        prev_speed = float(sample_speed_by_progress(progress_samples, speed_samples, np.array([prev_progress]))[0])
+        next_progress = prev_progress + prev_speed * dt
+        next_progress = min(next_progress, max_progress)
+        for _ in range(2):
+            next_speed = float(sample_speed_by_progress(progress_samples, speed_samples, np.array([next_progress]))[0])
+            next_progress = prev_progress + 0.5 * (prev_speed + next_speed) * dt
+            next_progress = min(next_progress, max_progress)
+        integrated[idx] = next_progress
+    return integrated
+
+
+def acceleration_from_speed(speed: np.ndarray, time: np.ndarray) -> np.ndarray:
+    if len(time) < 3:
+        return np.zeros_like(time, dtype=float)
+    return np.gradient(speed, strictly_increasing_param(time), edge_order=2)
+
+
+def jerk_from_acceleration(acceleration: np.ndarray, time: np.ndarray) -> np.ndarray:
+    if len(time) < 3:
+        return np.zeros_like(time, dtype=float)
+    return np.gradient(acceleration, strictly_increasing_param(time), edge_order=2)
+
+
 def chord_speed_from_trajectory(traj: Trajectory2D) -> np.ndarray:
     if len(traj.t) < 2:
         return np.zeros_like(traj.t, dtype=float)
@@ -222,6 +296,68 @@ def smoothstep(unit_value: np.ndarray) -> np.ndarray:
     return 3.0 * u**2 - 2.0 * u**3
 
 
+def solve_quintic_time_coeffs(
+    duration_s: float,
+    start_value: float,
+    start_velocity: float,
+    start_acceleration: float,
+    end_value: float,
+    end_velocity: float,
+    end_acceleration: float,
+) -> np.ndarray:
+    if duration_s <= 0.0:
+        raise ValueError("duration_s must be positive.")
+
+    T = float(duration_s)
+    a0 = float(start_value)
+    a1 = float(start_velocity)
+    a2 = 0.5 * float(start_acceleration)
+    system = np.array(
+        [
+            [T**3, T**4, T**5],
+            [3.0 * T**2, 4.0 * T**3, 5.0 * T**4],
+            [6.0 * T, 12.0 * T**2, 20.0 * T**3],
+        ],
+        dtype=float,
+    )
+    rhs = np.array(
+        [
+            end_value - (a0 + a1 * T + a2 * T**2),
+            end_velocity - (a1 + 2.0 * a2 * T),
+            end_acceleration - (2.0 * a2),
+        ],
+        dtype=float,
+    )
+    a3, a4, a5 = np.linalg.solve(system, rhs)
+    return np.array([a0, a1, a2, a3, a4, a5], dtype=float)
+
+
+def evaluate_quintic_time_profile(coeffs: np.ndarray, time_s: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    t = np.asarray(time_s, dtype=float)
+    value = (
+        coeffs[0]
+        + coeffs[1] * t
+        + coeffs[2] * t**2
+        + coeffs[3] * t**3
+        + coeffs[4] * t**4
+        + coeffs[5] * t**5
+    )
+    velocity = (
+        coeffs[1]
+        + 2.0 * coeffs[2] * t
+        + 3.0 * coeffs[3] * t**2
+        + 4.0 * coeffs[4] * t**3
+        + 5.0 * coeffs[5] * t**4
+    )
+    acceleration = (
+        2.0 * coeffs[2]
+        + 6.0 * coeffs[3] * t
+        + 12.0 * coeffs[4] * t**2
+        + 20.0 * coeffs[5] * t**3
+    )
+    return value, velocity, acceleration
+
+
 def split_pattern_name(pattern_name: str) -> tuple[str, str]:
     if "_" not in pattern_name:
         raise ValueError(f"Invalid pattern name: {pattern_name}")
@@ -246,9 +382,24 @@ def build_speed_profile(times: np.ndarray, speed_profile_name: str) -> np.ndarra
         speed = 10.0 - 4.0 * blend
     elif speed_profile_name == "accelerating":
         speed = 6.0 + 4.0 * blend
+    elif speed_profile_name == "stopping":
+        speed = np.full_like(times, 8.0, dtype=float)
+        stop_time_s = 5.0
+        future_blend = smoothstep(np.clip(times / stop_time_s, 0.0, 1.0))
+        future_mask = times > 0.0
+        speed[future_mask] = 8.0 * (1.0 - future_blend[future_mask])
+        speed[times >= stop_time_s] = 0.0
+    elif speed_profile_name == "stop8s":
+        speed = np.full_like(times, 8.0, dtype=float)
+        decel_start_s = 6.0
+        stop_time_s = OUTPUT_FUTURE_HORIZON_S
+        future_blend = smoothstep(np.clip((times - decel_start_s) / (stop_time_s - decel_start_s), 0.0, 1.0))
+        future_mask = times > decel_start_s
+        speed[future_mask] = 8.0 * (1.0 - future_blend[future_mask])
+        speed[times >= stop_time_s] = 0.0
     else:
         raise ValueError(f"Unsupported speed profile: {speed_profile_name}")
-    return np.clip(speed, 3.0, None)
+    return np.clip(speed, 0.0, None)
 
 
 def build_curvature_profile(s_rel: np.ndarray, shape_name: str) -> np.ndarray:
@@ -374,11 +525,20 @@ def load_test_pattern(
 
 def build_centerline(segment: Trajectory2D, dense_ds: float = 0.05) -> Centerline:
     s_samples = cumulative_distance(segment.x, segment.y)
-    dense_s = np.arange(0.0, s_samples[-1] + dense_ds * 0.5, dense_ds)
-    yaw_samples = np.unwrap(segment.yaw)
-    dense_x = np.interp(dense_s, s_samples, segment.x)
-    dense_y = np.interp(dense_s, s_samples, segment.y)
-    dense_yaw = np.interp(dense_s, s_samples, yaw_samples)
+    unique_s, unique_indices = np.unique(s_samples, return_index=True)
+    x_samples = segment.x[unique_indices]
+    y_samples = segment.y[unique_indices]
+    yaw_samples = np.unwrap(segment.yaw[unique_indices])
+    if len(unique_s) == 1:
+        dense_s = unique_s.copy()
+        dense_x = x_samples.copy()
+        dense_y = y_samples.copy()
+        dense_yaw = yaw_samples.copy()
+    else:
+        dense_s = np.arange(0.0, unique_s[-1] + dense_ds * 0.5, dense_ds)
+        dense_x = np.interp(dense_s, unique_s, x_samples)
+        dense_y = np.interp(dense_s, unique_s, y_samples)
+        dense_yaw = np.interp(dense_s, unique_s, yaw_samples)
     return Centerline(s=dense_s, x=dense_x, y=dense_y, yaw=dense_yaw)
 
 
@@ -568,11 +728,10 @@ def build_full_augmented_path(
     centerline: Centerline,
     merge_path: DensePath,
     s_merge: float,
-    connect_budget_m: float,
     total_distance_m: float,
     dense_ds: float = 0.05,
 ) -> DensePath:
-    continuation_end_s = s_merge + (total_distance_m - connect_budget_m)
+    continuation_end_s = total_distance_m
     continuation_s = np.arange(s_merge, continuation_end_s, dense_ds)
     if len(continuation_s) == 0 or not np.isclose(continuation_s[-1], continuation_end_s):
         continuation_s = np.append(continuation_s, continuation_end_s)
@@ -585,6 +744,17 @@ def build_full_augmented_path(
     full_y = np.concatenate((merge_path.y, cont_y[1:]))
     full_yaw = heading_from_xy(full_x, full_y, full_sigma)
     return DensePath(sigma=full_sigma, x=full_x, y=full_y, yaw=full_yaw)
+
+
+def sample_dense_path(path: DensePath, sigma_query: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(path.sigma) == 0:
+        raise ValueError("DensePath must contain at least one sample.")
+    sigma = strictly_increasing_param(path.sigma)
+    sigma_clamped = np.clip(sigma_query, sigma[0], sigma[-1])
+    x = np.interp(sigma_clamped, sigma, path.x)
+    y = np.interp(sigma_clamped, sigma, path.y)
+    yaw = wrap_angle(np.interp(sigma_clamped, sigma, np.unwrap(path.yaw)))
+    return x, y, yaw
 
 
 def extract_future_segment(gt: Trajectory2D, current_index: int) -> Trajectory2D:
@@ -619,45 +789,46 @@ def augment_directed_segment(
 
     centerline = build_centerline(segment, dense_ds=dense_ds)
     distance_profile = cumulative_distance(segment.x, segment.y)
-    total_distance_m = distance_profile[-1]
-
+    progress_time_samples, progress_time_lookup = build_progress_time_lookup(distance_profile, segment.t)
     connect_budget_m = float(np.interp(connect_time_s, segment.t, distance_profile))
-    s_merge, merge_path, connect_speed_scale = plan_recovery_path(
+    total_distance_m = float(distance_profile[-1])
+    s_merge, merge_path, speed_scale = plan_recovery_path(
         centerline=centerline,
         distance_budget_m=connect_budget_m,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
         dense_ds=dense_ds,
     )
-
     dense_full_path = build_full_augmented_path(
         centerline=centerline,
         merge_path=merge_path,
         s_merge=s_merge,
-        connect_budget_m=connect_budget_m,
         total_distance_m=total_distance_m,
         dense_ds=dense_ds,
     )
 
+    merge_path_length_m = float(merge_path.sigma[-1]) if len(merge_path.sigma) > 0 else 0.0
+
     connect_mask = segment.t <= connect_time_s + 1.0e-9
-    query_x = np.zeros_like(segment.x)
-    query_y = np.zeros_like(segment.y)
-    progress_profile = np.zeros_like(segment.t)
+    progress_profile = distance_profile.copy()
+    if connect_budget_m > 1.0e-9:
+        progress_profile[connect_mask] = distance_profile[connect_mask] * speed_scale
+    else:
+        progress_profile[connect_mask] = 0.0
+    post_indices = np.where(~connect_mask)[0]
+    if len(post_indices) > 0:
+        merge_time_on_gt = float(np.interp(s_merge, progress_time_samples, progress_time_lookup))
+        # Shift the GT progress-time relation so the merged centerline position is reached
+        # at connect_time_s. This preserves "same speed at same position" without
+        # numerically snapping to the GT endpoint too early near a stop.
+        shifted_gt_time = merge_time_on_gt + (segment.t[post_indices] - connect_time_s)
+        shifted_gt_time = np.clip(shifted_gt_time, segment.t[0], segment.t[-1])
+        centerline_progress = np.interp(shifted_gt_time, segment.t, distance_profile)
+        progress_profile[post_indices] = merge_path_length_m + (centerline_progress - s_merge)
+    progress_profile = np.clip(progress_profile, 0.0, dense_full_path.sigma[-1])
 
-    connect_sigma = connect_speed_scale * distance_profile[connect_mask]
-    query_x[connect_mask] = np.interp(connect_sigma, merge_path.sigma, merge_path.x)
-    query_y[connect_mask] = np.interp(connect_sigma, merge_path.sigma, merge_path.y)
-    progress_profile[connect_mask] = connect_sigma
-
-    continue_mask = ~connect_mask
-    if np.any(continue_mask):
-        continue_s = s_merge + (distance_profile[continue_mask] - connect_budget_m)
-        cont_x, cont_y, _ = sample_centerline(centerline, continue_s)
-        query_x[continue_mask] = cont_x
-        query_y[continue_mask] = cont_y
-        progress_profile[continue_mask] = merge_path.sigma[-1] + (distance_profile[continue_mask] - connect_budget_m)
-
-    directional_yaw = compute_forward_yaw(query_x, query_y, fallback_yaw=segment.yaw)
+    query_x, query_y, directional_yaw = sample_dense_path(dense_full_path, progress_profile)
+    exact_speed_profile = speed_from_progress(progress_profile, segment.t)
     augmented_segment = Trajectory2D(
         t=segment.t.copy(),
         x=query_x,
@@ -672,11 +843,12 @@ def augment_directed_segment(
         dense_augmented_path=dense_full_path,
         distance_profile=distance_profile,
         progress_profile=progress_profile,
+        exact_speed_profile=exact_speed_profile,
         connect_time_s=connect_time_s,
         merge_centerline_s=s_merge,
-        merge_path_length_m=merge_path.sigma[-1],
+        merge_path_length_m=merge_path_length_m,
         connect_distance_budget_m=connect_budget_m,
-        connect_speed_scale=connect_speed_scale,
+        connect_speed_scale=speed_scale,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
     )
@@ -827,27 +999,66 @@ def format_yaw_suffix(value_deg: float) -> str:
 
 
 def exact_arc_speed_in_window(result: BidirectionalAugmentationResult) -> tuple[np.ndarray, np.ndarray]:
-    past_gt_speed = speed_from_progress(
-        result.past_segment.distance_profile,
-        result.past_segment.original_segment.t,
-    )[::-1]
-    past_aug_speed = speed_from_progress(
-        result.past_segment.progress_profile,
-        result.past_segment.augmented_segment.t,
-    )[::-1]
-    future_gt_speed = speed_from_progress(
-        result.future_segment.distance_profile,
-        result.future_segment.original_segment.t,
-    )
-    future_aug_speed = speed_from_progress(
-        result.future_segment.progress_profile,
-        result.future_segment.augmented_segment.t,
-    )
+    past_gt_speed = speed_from_progress(result.past_segment.distance_profile, result.past_segment.original_segment.t)[::-1]
+    past_aug_speed = result.past_segment.exact_speed_profile[::-1]
+    future_gt_speed = speed_from_progress(result.future_segment.distance_profile, result.future_segment.original_segment.t)
+    future_aug_speed = result.future_segment.exact_speed_profile
 
     gt_full_speed = np.concatenate((past_gt_speed[:-1], future_gt_speed))
     aug_full_speed = np.concatenate((past_aug_speed[:-1], future_aug_speed))
     window_slice = slice(result.window_start_index, result.window_end_index + 1)
     return gt_full_speed[window_slice], aug_full_speed[window_slice]
+
+
+def exact_arc_kinematics_in_window(
+    result: BidirectionalAugmentationResult,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    time = result.original_window.t.copy()
+    gt_speed, augmented_speed = exact_arc_speed_in_window(result)
+    gt_acceleration = acceleration_from_speed(gt_speed, time)
+    augmented_acceleration = acceleration_from_speed(augmented_speed, time)
+    gt_jerk = jerk_from_acceleration(gt_acceleration, time)
+    augmented_jerk = jerk_from_acceleration(augmented_acceleration, time)
+    return time, gt_speed, augmented_speed, gt_acceleration, augmented_acceleration, gt_jerk, augmented_jerk
+
+
+def segment_kinematics(
+    segment_result: SegmentAugmentationResult,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    gt_speed = speed_from_progress(segment_result.distance_profile, segment_result.original_segment.t)
+    augmented_speed = segment_result.exact_speed_profile
+    gt_acceleration = acceleration_from_speed(gt_speed, segment_result.original_segment.t)
+    augmented_acceleration = acceleration_from_speed(augmented_speed, segment_result.augmented_segment.t)
+    gt_jerk = jerk_from_acceleration(gt_acceleration, segment_result.original_segment.t)
+    augmented_jerk = jerk_from_acceleration(augmented_acceleration, segment_result.augmented_segment.t)
+    return gt_speed, augmented_speed, gt_jerk, augmented_jerk
+
+
+def bridge_constraint_series(
+    result: BidirectionalAugmentationResult,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    past_gt_speed, past_aug_speed, past_gt_jerk, past_aug_jerk = segment_kinematics(result.past_segment)
+    future_gt_speed, future_aug_speed, future_gt_jerk, future_aug_jerk = segment_kinematics(result.future_segment)
+
+    past_time = -result.past_segment.original_segment.t[::-1]
+    future_time = result.future_segment.original_segment.t
+
+    full_time = np.concatenate((past_time[:-1], future_time))
+    full_bridge_mask = (
+        (full_time >= -result.past_connect_time_s - 1.0e-9)
+        & (full_time <= result.future_recover_time_s + 1.0e-9)
+    )
+    full_speed_gap = np.concatenate((np.abs(past_aug_speed - past_gt_speed)[::-1][:-1], np.abs(future_aug_speed - future_gt_speed)))
+    full_gt_jerk = np.concatenate((past_gt_jerk[::-1][:-1], future_gt_jerk))
+    full_augmented_jerk = np.concatenate((past_aug_jerk[::-1][:-1], future_aug_jerk))
+    window_slice = slice(result.window_start_index, result.window_end_index + 1)
+    return (
+        full_time[window_slice],
+        full_bridge_mask[window_slice],
+        full_speed_gap[window_slice],
+        full_gt_jerk[window_slice],
+        full_augmented_jerk[window_slice],
+    )
 
 
 def lateral_acceleration_from_speed_and_curvature(
@@ -857,11 +1068,21 @@ def lateral_acceleration_from_speed_and_curvature(
     return speed_mps * speed_mps * curvature_inv_m
 
 
-def evaluate_lateral_accel_in_window(
+def evaluate_constraints_in_window(
     result: BidirectionalAugmentationResult,
-    limit_mps2: float,
-) -> LateralAccelDiagnostics:
-    gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
+    max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
+) -> ConstraintDiagnostics:
+    (
+        time,
+        gt_arc_speed,
+        augmented_arc_speed,
+        _gt_acceleration,
+        _augmented_acceleration,
+        gt_jerk,
+        augmented_jerk,
+    ) = exact_arc_kinematics_in_window(result)
     gt_curvature = curvature_from_xy(
         result.original_window.x,
         result.original_window.y,
@@ -879,14 +1100,34 @@ def evaluate_lateral_accel_in_window(
         augmented_curvature,
     )
     max_abs_augmented_lateral_accel = float(np.max(np.abs(augmented_lateral_accel)))
+    bridge_time, bridge_mask, bridge_speed_gap, gt_jerk, augmented_jerk = bridge_constraint_series(result)
+    max_speed_gap = float(np.max(bridge_speed_gap[bridge_mask])) if np.any(bridge_mask) else 0.0
+    max_abs_bridge_jerk = float(np.max(np.abs(augmented_jerk[bridge_mask]))) if np.any(bridge_mask) else 0.0
 
-    return LateralAccelDiagnostics(
-        limit_mps2=float(limit_mps2),
-        time=result.original_window.t.copy(),
+    lateral_accel_passes = max_abs_augmented_lateral_accel <= float(max_lateral_accel_mps2) + 1.0e-9
+    speed_gap_passes = max_speed_gap <= float(max_bridge_speed_gap_mps) + 1.0e-9
+    jerk_passes = max_abs_bridge_jerk <= float(max_bridge_jerk_mps3) + 1.0e-9
+
+    return ConstraintDiagnostics(
+        time=bridge_time,
+        bridge_mask=bridge_mask,
+        lateral_accel_limit_mps2=float(max_lateral_accel_mps2),
+        speed_gap_limit_mps=float(max_bridge_speed_gap_mps),
+        jerk_limit_mps3=float(max_bridge_jerk_mps3),
         gt_lateral_accel_mps2=gt_lateral_accel,
         augmented_lateral_accel_mps2=augmented_lateral_accel,
         max_abs_augmented_lateral_accel_mps2=max_abs_augmented_lateral_accel,
-        passes=max_abs_augmented_lateral_accel <= float(limit_mps2) + 1.0e-9,
+        gt_arc_speed_mps=gt_arc_speed,
+        augmented_arc_speed_mps=augmented_arc_speed,
+        bridge_speed_gap_mps=bridge_speed_gap,
+        max_bridge_speed_gap_mps=max_speed_gap,
+        gt_longitudinal_jerk_mps3=gt_jerk,
+        augmented_longitudinal_jerk_mps3=augmented_jerk,
+        max_abs_bridge_jerk_mps3=max_abs_bridge_jerk,
+        lateral_accel_passes=lateral_accel_passes,
+        speed_gap_passes=speed_gap_passes,
+        jerk_passes=jerk_passes,
+        passes=lateral_accel_passes and speed_gap_passes and jerk_passes,
     )
 
 
@@ -900,14 +1141,21 @@ def generate_time_candidates(
     return [tick * step_s for tick in range(start_tick, end_tick + 1)]
 
 
-def search_lateral_accel_feasible_result(
+def search_feasible_result(
     initial_result: BidirectionalAugmentationResult,
     max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
     search_step_s: float = DEFAULT_DT,
     max_future_recover_time_s: float = FULL_FUTURE_HORIZON_S,
     max_past_connect_time_s: float = FULL_PAST_HORIZON_S,
 ) -> FeasibilitySearchDiagnostics:
-    initial = evaluate_lateral_accel_in_window(initial_result, max_lateral_accel_mps2)
+    initial = evaluate_constraints_in_window(
+        initial_result,
+        max_lateral_accel_mps2=max_lateral_accel_mps2,
+        max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+        max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+    )
     if initial.passes:
         return FeasibilitySearchDiagnostics(
             initial=initial,
@@ -939,7 +1187,12 @@ def search_lateral_accel_feasible_result(
     )
     for candidate_n in future_candidates:
         candidate_result = build_candidate(candidate_n, initial_m)
-        candidate_diag = evaluate_lateral_accel_in_window(candidate_result, max_lateral_accel_mps2)
+        candidate_diag = evaluate_constraints_in_window(
+            candidate_result,
+            max_lateral_accel_mps2=max_lateral_accel_mps2,
+            max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+            max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+        )
         if candidate_diag.passes:
             return FeasibilitySearchDiagnostics(
                 initial=initial,
@@ -961,7 +1214,12 @@ def search_lateral_accel_feasible_result(
     for candidate_m in past_candidates:
         for candidate_n in future_with_past_candidates:
             candidate_result = build_candidate(candidate_n, candidate_m)
-            candidate_diag = evaluate_lateral_accel_in_window(candidate_result, max_lateral_accel_mps2)
+            candidate_diag = evaluate_constraints_in_window(
+                candidate_result,
+                max_lateral_accel_mps2=max_lateral_accel_mps2,
+                max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+                max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+            )
             if candidate_diag.passes:
                 strategy = "extend M" if np.isclose(candidate_n, initial_n) else "extend M and N"
                 return FeasibilitySearchDiagnostics(
@@ -976,6 +1234,24 @@ def search_lateral_accel_feasible_result(
         adapted_result=None,
         adapted=None,
         adaptation_strategy=None,
+    )
+
+
+def search_lateral_accel_feasible_result(
+    initial_result: BidirectionalAugmentationResult,
+    max_lateral_accel_mps2: float,
+    search_step_s: float = DEFAULT_DT,
+    max_future_recover_time_s: float = FULL_FUTURE_HORIZON_S,
+    max_past_connect_time_s: float = FULL_PAST_HORIZON_S,
+) -> FeasibilitySearchDiagnostics:
+    return search_feasible_result(
+        initial_result=initial_result,
+        max_lateral_accel_mps2=max_lateral_accel_mps2,
+        max_bridge_speed_gap_mps=np.inf,
+        max_bridge_jerk_mps3=np.inf,
+        search_step_s=search_step_s,
+        max_future_recover_time_s=max_future_recover_time_s,
+        max_past_connect_time_s=max_past_connect_time_s,
     )
 
 
@@ -1006,235 +1282,379 @@ def make_demo_figure(
     result: BidirectionalAugmentationResult,
     output_path: Path,
     feasibility: FeasibilitySearchDiagnostics | None = None,
+    seed_result: BidirectionalAugmentationResult | None = None,
 ) -> None:
-    gt_full = result.original_full
-    gt = result.original_window
-    augmented = result.augmented_window
+    best_result = result
+    seed_result = best_result if seed_result is None else seed_result
+    has_distinct_seed = seed_result is not best_result
 
-    gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
+    gt_full = best_result.original_full
+    gt = best_result.original_window
+    best = best_result.augmented_window
+    seed = seed_result.augmented_window
+
+    (
+        time,
+        gt_arc_speed,
+        best_arc_speed,
+        _gt_acceleration,
+        _best_acceleration,
+        _gt_jerk,
+        _best_jerk,
+    ) = exact_arc_kinematics_in_window(best_result)
     gt_chord_speed = chord_speed_from_trajectory(gt)
-    augmented_chord_speed = chord_speed_from_trajectory(augmented)
+    best_chord_speed = chord_speed_from_trajectory(best)
     gt_curvature = curvature_from_xy(gt.x, gt.y, cumulative_distance(gt.x, gt.y))
-    augmented_curvature = curvature_from_xy(augmented.x, augmented.y, cumulative_distance(augmented.x, augmented.y))
+    best_curvature = curvature_from_xy(best.x, best.y, cumulative_distance(best.x, best.y))
 
-    current_index_in_window = result.current_index - result.window_start_index
-    current_x = augmented.x[current_index_in_window]
-    current_y = augmented.y[current_index_in_window]
+    _, seed_arc_speed = exact_arc_speed_in_window(seed_result)
+    seed_chord_speed = chord_speed_from_trajectory(seed)
+    seed_curvature = curvature_from_xy(seed.x, seed.y, cumulative_distance(seed.x, seed.y))
+
+    current_index_in_window = best_result.current_index - best_result.window_start_index
+    current_x = best.x[current_index_in_window]
+    current_y = best.y[current_index_in_window]
 
     future_merge_x, future_merge_y, _ = sample_centerline(
-        result.future_segment.centerline,
-        np.array([result.future_segment.merge_centerline_s]),
+        best_result.future_segment.centerline,
+        np.array([best_result.future_segment.merge_centerline_s]),
     )
     past_merge_x, past_merge_y, _ = sample_centerline(
-        result.past_segment.centerline,
-        np.array([result.past_segment.merge_centerline_s]),
+        best_result.past_segment.centerline,
+        np.array([best_result.past_segment.merge_centerline_s]),
     )
 
-    adapted_result = feasibility.adapted_result if feasibility is not None else None
-    if adapted_result is result:
-        adapted_result = None
-    adapted = adapted_result.augmented_window if adapted_result is not None else None
-    adapted_arc_speed = None
-    adapted_curvature = None
-    if adapted_result is not None:
-        _, adapted_arc_speed = exact_arc_speed_in_window(adapted_result)
-        adapted_curvature = curvature_from_xy(
-            adapted.x,
-            adapted.y,
-            cumulative_distance(adapted.x, adapted.y),
-        )
+    seed_diag = feasibility.initial if feasibility is not None else None
+    best_diag = None
+    if feasibility is not None:
+        if feasibility.adapted_result is best_result and feasibility.adapted is not None:
+            best_diag = feasibility.adapted
+        else:
+            best_diag = feasibility.initial
+    if best_diag is None and seed_diag is not None:
+        best_diag = seed_diag
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
-    axes = axes.reshape(-1)
+    fig = plt.figure(figsize=(18, 16), constrained_layout=True)
+    grid = fig.add_gridspec(4, 2, height_ratios=[1.45, 1.0, 1.0, 1.0])
+    ax_traj = fig.add_subplot(grid[0, :])
+    ax_speed = fig.add_subplot(grid[1, 0])
+    ax_curvature = fig.add_subplot(grid[1, 1])
+    ax_lat = fig.add_subplot(grid[2, 0])
+    ax_gap = fig.add_subplot(grid[2, 1])
+    ax_jerk = fig.add_subplot(grid[3, :])
 
-    axes[0].plot(gt_full.x, gt_full.y, color="0.88", lw=1.5, label="GT full context")
-    axes[0].plot(gt.x, gt.y, color="0.55", lw=2.0, label="GT window")
-    axes[0].plot(augmented.x[: current_index_in_window + 1], augmented.y[: current_index_in_window + 1], color="#2ca02c", lw=2.5, label="Augmented past")
-    axes[0].plot(augmented.x[current_index_in_window:], augmented.y[current_index_in_window:], color="#ff7f0e", lw=2.5, label="Augmented future")
-    if adapted is not None:
-        axes[0].plot(
-            adapted.x,
-            adapted.y,
-            color="#1f77b4",
-            lw=2.0,
-            ls="-.",
-            label="Lowest pass candidate",
-        )
-    plot_pose_triangles(axes[0], gt.x, gt.y, gt.yaw, color="0.45", size=34, alpha=0.65, zorder=2.5)
-    plot_pose_triangles(
-        axes[0],
-        augmented.x,
-        augmented.y,
-        augmented.yaw,
+    gt_full_handle = ax_traj.plot(gt_full.x, gt_full.y, color="0.88", lw=1.5, label="GT full context", zorder=0.5)[0]
+    gt_window_handle = ax_traj.plot(gt.x, gt.y, color="0.55", lw=2.0, label="GT window", zorder=1.0)[0]
+    best_handle = ax_traj.plot(best.x, best.y, color="#1f77b4", lw=2.4, label="Best Trajectory", zorder=2.0)[0]
+    seed_handle = ax_traj.plot(
+        seed.x,
+        seed.y,
         color="#ff7f0e",
+        lw=2.2,
+        ls="--",
+        alpha=0.95,
+        label="Seed Trajectory",
+        zorder=3.0,
+    )[0]
+    plot_pose_triangles(ax_traj, gt.x, gt.y, gt.yaw, color="0.45", size=34, alpha=0.65, zorder=2.5)
+    plot_pose_triangles(
+        ax_traj,
+        best.x,
+        best.y,
+        best.yaw,
+        color="#1f77b4",
         size=38,
         alpha=0.85,
         zorder=3.2,
     )
-    axes[0].scatter(current_x, current_y, color="#d62728", s=60, label="Offset at t0")
-    axes[0].scatter(past_merge_x[0], past_merge_y[0], color="#1f77b4", s=45, label="Past merge")
-    axes[0].scatter(future_merge_x[0], future_merge_y[0], color="#9467bd", s=45, label="Future merge")
-    axes[0].set_title("Trajectory")
-    axes[0].set_xlabel("x [m]")
-    axes[0].set_ylabel("y [m]")
-    axes[0].axis("equal")
-    axes[0].grid(True, alpha=0.25)
-    axes[0].legend(loc="best")
+    current_handle = ax_traj.scatter(current_x, current_y, color="#d62728", s=60, label="Best offset at t0")
+    past_merge_handle = ax_traj.scatter(past_merge_x[0], past_merge_y[0], color="#2ca02c", s=45, label="Best past merge")
+    future_merge_handle = ax_traj.scatter(future_merge_x[0], future_merge_y[0], color="#9467bd", s=45, label="Best future merge")
+    ax_traj.set_title("Trajectory")
+    ax_traj.set_xlabel("x [m]")
+    ax_traj.set_ylabel("y [m]")
+    ax_traj.axis("equal")
+    ax_traj.grid(True, alpha=0.25)
+    traj_handles = [gt_full_handle, gt_window_handle, best_handle, seed_handle]
+    traj_handles.extend([current_handle, past_merge_handle, future_merge_handle])
+    ax_traj.legend(
+        handles=traj_handles,
+        loc="upper left",
+        ncol=2,
+        fontsize=8.5,
+        framealpha=0.92,
+        columnspacing=1.2,
+        handlelength=2.2,
+    )
 
-    axes[1].plot(gt.t, gt_arc_speed, color="0.45", lw=2.0, label="GT exact arc")
-    axes[1].plot(gt.t, gt_chord_speed, color="0.55", lw=1.7, ls="--", label="GT chord")
-    axes[1].plot(augmented.t, augmented_arc_speed, color="#ff7f0e", lw=2.0, label="Aug exact arc")
-    axes[1].plot(augmented.t, augmented_chord_speed, color="#d95f02", lw=1.7, ls="--", label="Aug chord")
-    if adapted is not None and adapted_arc_speed is not None:
-        axes[1].plot(
-            adapted.t,
-            adapted_arc_speed,
+    ax_speed.plot(time, gt_arc_speed, color="0.45", lw=2.0, label="GT exact arc", zorder=1.0)
+    ax_speed.plot(gt.t, gt_chord_speed, color="0.55", lw=1.7, ls="--", label="GT chord", zorder=1.0)
+    ax_speed.plot(time, best_arc_speed, color="#1f77b4", lw=2.0, label="Best Trajectory exact arc", zorder=2.0)
+    ax_speed.plot(best.t, best_chord_speed, color="#6baed6", lw=1.7, ls="--", label="Best Trajectory chord", zorder=2.0)
+    ax_speed.plot(
+        time,
+        seed_arc_speed,
+        color="#ff7f0e",
+        lw=2.1,
+        ls="--",
+        alpha=0.95,
+        label="Seed Trajectory exact arc",
+        zorder=3.0,
+    )
+    ax_speed.plot(
+        seed.t,
+        seed_chord_speed,
+        color="#d95f02",
+        lw=1.8,
+        ls=":",
+        alpha=0.95,
+        label="Seed Trajectory chord",
+        zorder=3.0,
+    )
+    ax_speed.axvline(-best_result.past_connect_time_s, color="#2ca02c", ls="--", lw=1.2)
+    ax_speed.axvline(0.0, color="0.35", ls=":", lw=1.2)
+    ax_speed.axvline(best_result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
+    ax_speed.set_xlim(gt.t[0], gt.t[-1])
+    ax_speed.set_title("Speed (Arc + Chord)")
+    ax_speed.set_xlabel("time [s]")
+    ax_speed.set_ylabel("speed [m/s]")
+    ax_speed.grid(True, alpha=0.25)
+    ax_speed.legend(loc="best")
+
+    ax_curvature.plot(gt.t, gt_curvature, color="0.55", lw=2.0, label="GT window", zorder=1.0)
+    ax_curvature.plot(best.t, best_curvature, color="#1f77b4", lw=2.0, label="Best Trajectory", zorder=2.0)
+    ax_curvature.plot(
+        seed.t,
+        seed_curvature,
+        color="#ff7f0e",
+        lw=2.1,
+        ls="--",
+        alpha=0.95,
+        label="Seed Trajectory",
+        zorder=3.0,
+    )
+    ax_curvature.axvline(-best_result.past_connect_time_s, color="#2ca02c", ls="--", lw=1.2)
+    ax_curvature.axvline(0.0, color="0.35", ls=":", lw=1.2)
+    ax_curvature.axvline(best_result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
+    ax_curvature.set_xlim(gt.t[0], gt.t[-1])
+    ax_curvature.set_title("Curvature")
+    ax_curvature.set_xlabel("time [s]")
+    ax_curvature.set_ylabel("curvature [1/m]")
+    ax_curvature.grid(True, alpha=0.25)
+    ax_curvature.legend(loc="best")
+
+    if seed_diag is not None and best_diag is not None:
+        ax_lat.plot(seed_diag.time, seed_diag.gt_lateral_accel_mps2, color="0.55", lw=2.0, label="GT", zorder=1.0)
+        ax_lat.plot(
+            best_diag.time,
+            best_diag.augmented_lateral_accel_mps2,
             color="#1f77b4",
-            lw=1.9,
-            ls="-.",
-            label="Pass candidate exact arc",
-        )
-    axes[1].axvline(-result.past_connect_time_s, color="#1f77b4", ls="--", lw=1.2)
-    axes[1].axvline(0.0, color="0.35", ls=":", lw=1.2)
-    axes[1].axvline(result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
-    axes[1].set_xlim(gt.t[0], gt.t[-1])
-    axes[1].set_title("Speed (Arc + Chord)")
-    axes[1].set_xlabel("time [s]")
-    axes[1].set_ylabel("speed [m/s]")
-    axes[1].grid(True, alpha=0.25)
-    axes[1].legend(loc="best")
-
-    axes[2].plot(gt.t, gt_curvature, color="0.55", lw=2.0, label="GT window")
-    axes[2].plot(augmented.t, augmented_curvature, color="#ff7f0e", lw=2.0, label="Augmented window")
-    if adapted is not None and adapted_curvature is not None:
-        axes[2].plot(
-            adapted.t,
-            adapted_curvature,
-            color="#1f77b4",
-            lw=1.9,
-            ls="-.",
-            label="Pass candidate",
-        )
-    axes[2].axvline(-result.past_connect_time_s, color="#1f77b4", ls="--", lw=1.2)
-    axes[2].axvline(0.0, color="0.35", ls=":", lw=1.2)
-    axes[2].axvline(result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
-    axes[2].set_xlim(gt.t[0], gt.t[-1])
-    axes[2].set_title("Curvature")
-    axes[2].set_xlabel("time [s]")
-    axes[2].set_ylabel("curvature [1/m]")
-    axes[2].grid(True, alpha=0.25)
-    axes[2].legend(loc="best")
-
-    if feasibility is not None:
-        initial_diag = feasibility.initial
-        axes[3].plot(
-            initial_diag.time,
-            initial_diag.gt_lateral_accel_mps2,
-            color="0.55",
             lw=2.0,
-            label="GT",
+            label="Best Trajectory",
+            zorder=2.0,
         )
-        axes[3].plot(
-            initial_diag.time,
-            initial_diag.augmented_lateral_accel_mps2,
+        ax_lat.plot(
+            seed_diag.time,
+            seed_diag.augmented_lateral_accel_mps2,
             color="#ff7f0e",
-            lw=2.0,
-            label="Auto-search seed",
+            lw=2.1,
+            ls="--",
+            alpha=0.95,
+            label="Seed Trajectory",
+            zorder=3.0,
         )
-        violation_mask = np.abs(initial_diag.augmented_lateral_accel_mps2) > initial_diag.limit_mps2 + 1.0e-9
+        violation_diag = seed_diag if has_distinct_seed else best_diag
+        violation_mask = (
+            np.abs(violation_diag.augmented_lateral_accel_mps2)
+            > violation_diag.lateral_accel_limit_mps2 + 1.0e-9
+        )
         if np.any(violation_mask):
-            axes[3].scatter(
-                initial_diag.time[violation_mask],
-                initial_diag.augmented_lateral_accel_mps2[violation_mask],
+            ax_lat.scatter(
+                violation_diag.time[violation_mask],
+                violation_diag.augmented_lateral_accel_mps2[violation_mask],
                 color="#d62728",
                 s=26,
                 zorder=3.0,
                 label="Limit exceeded",
             )
-        if feasibility.adapted is not None:
-            axes[3].plot(
-                feasibility.adapted.time,
-                feasibility.adapted.augmented_lateral_accel_mps2,
-                color="#1f77b4",
-                lw=1.9,
-                ls="-.",
-                label="Lowest pass candidate",
+        ax_lat.axhline(seed_diag.lateral_accel_limit_mps2, color="#d62728", ls="--", lw=1.2)
+        ax_lat.axhline(-seed_diag.lateral_accel_limit_mps2, color="#d62728", ls="--", lw=1.2)
+        ax_lat.axvline(-best_result.past_connect_time_s, color="#2ca02c", ls="--", lw=1.2)
+        ax_lat.axvline(0.0, color="0.35", ls=":", lw=1.2)
+        ax_lat.axvline(best_result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
+        ax_lat.set_xlim(seed_diag.time[0], seed_diag.time[-1])
+        ax_lat.set_ylim(-2.0 * seed_diag.lateral_accel_limit_mps2, 2.0 * seed_diag.lateral_accel_limit_mps2)
+        ax_lat.set_title("Lateral Acceleration")
+        ax_lat.set_xlabel("time [s]")
+        ax_lat.set_ylabel("a_lat [m/s^2]")
+        ax_lat.grid(True, alpha=0.25)
+        ax_lat.legend(loc="best")
+
+        ax_gap.plot(
+            best_diag.time,
+            best_diag.bridge_speed_gap_mps,
+            color="#1f77b4",
+            lw=2.0,
+            label="Best Trajectory",
+            zorder=2.0,
+        )
+        ax_gap.plot(
+            seed_diag.time,
+            seed_diag.bridge_speed_gap_mps,
+            color="#ff7f0e",
+            lw=2.1,
+            ls="--",
+            alpha=0.95,
+            label="Seed Trajectory",
+            zorder=3.0,
+        )
+        speed_gap_violation_diag = seed_diag if has_distinct_seed else best_diag
+        speed_gap_violation_mask = (
+            speed_gap_violation_diag.bridge_mask
+            & (speed_gap_violation_diag.bridge_speed_gap_mps > speed_gap_violation_diag.speed_gap_limit_mps + 1.0e-9)
+        )
+        if np.any(speed_gap_violation_mask):
+            ax_gap.scatter(
+                speed_gap_violation_diag.time[speed_gap_violation_mask],
+                speed_gap_violation_diag.bridge_speed_gap_mps[speed_gap_violation_mask],
+                color="#d62728",
+                s=26,
+                zorder=3.0,
+                label="Limit exceeded",
             )
-        axes[3].axhline(initial_diag.limit_mps2, color="#d62728", ls="--", lw=1.2)
-        axes[3].axhline(-initial_diag.limit_mps2, color="#d62728", ls="--", lw=1.2)
-        axes[3].axvline(0.0, color="0.35", ls=":", lw=1.2)
-        axes[3].set_xlim(initial_diag.time[0], initial_diag.time[-1])
-        axes[3].set_ylim(-2.0 * initial_diag.limit_mps2, 2.0 * initial_diag.limit_mps2)
-        axes[3].set_title("Lateral Acceleration")
-        axes[3].set_xlabel("time [s]")
-        axes[3].set_ylabel("a_lat [m/s^2]")
-        axes[3].grid(True, alpha=0.25)
-        axes[3].legend(loc="best")
+        ax_gap.axhline(seed_diag.speed_gap_limit_mps, color="#d62728", ls="--", lw=1.2)
+        ax_gap.axvline(-best_result.past_connect_time_s, color="#2ca02c", ls="--", lw=1.2)
+        ax_gap.axvline(0.0, color="0.35", ls=":", lw=1.2)
+        ax_gap.axvline(best_result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
+        ax_gap.set_xlim(seed_diag.time[0], seed_diag.time[-1])
+        ax_gap.set_title("Bridge Speed Gap")
+        ax_gap.set_xlabel("time [s]")
+        ax_gap.set_ylabel("|v_aug - v_gt| [m/s]")
+        ax_gap.grid(True, alpha=0.25)
+        ax_gap.legend(loc="best")
+
+        ax_jerk.plot(seed_diag.time, seed_diag.gt_longitudinal_jerk_mps3, color="0.55", lw=2.0, label="GT", zorder=1.0)
+        ax_jerk.plot(
+            best_diag.time,
+            best_diag.augmented_longitudinal_jerk_mps3,
+            color="#1f77b4",
+            lw=2.0,
+            label="Best Trajectory",
+            zorder=2.0,
+        )
+        ax_jerk.plot(
+            seed_diag.time,
+            seed_diag.augmented_longitudinal_jerk_mps3,
+            color="#ff7f0e",
+            lw=2.1,
+            ls="--",
+            alpha=0.95,
+            label="Seed Trajectory",
+            zorder=3.0,
+        )
+        jerk_violation_diag = seed_diag if has_distinct_seed else best_diag
+        jerk_violation_mask = (
+            jerk_violation_diag.bridge_mask
+            & (np.abs(jerk_violation_diag.augmented_longitudinal_jerk_mps3) > jerk_violation_diag.jerk_limit_mps3 + 1.0e-9)
+        )
+        if np.any(jerk_violation_mask):
+            ax_jerk.scatter(
+                jerk_violation_diag.time[jerk_violation_mask],
+                jerk_violation_diag.augmented_longitudinal_jerk_mps3[jerk_violation_mask],
+                color="#d62728",
+                s=26,
+                zorder=3.0,
+                label="Limit exceeded",
+            )
+        ax_jerk.axhline(seed_diag.jerk_limit_mps3, color="#d62728", ls="--", lw=1.2)
+        ax_jerk.axhline(-seed_diag.jerk_limit_mps3, color="#d62728", ls="--", lw=1.2)
+        ax_jerk.axvline(-best_result.past_connect_time_s, color="#2ca02c", ls="--", lw=1.2)
+        ax_jerk.axvline(0.0, color="0.35", ls=":", lw=1.2)
+        ax_jerk.axvline(best_result.future_recover_time_s, color="#9467bd", ls="--", lw=1.2)
+        ax_jerk.set_xlim(seed_diag.time[0], seed_diag.time[-1])
+        ax_jerk.set_title("Bridge Longitudinal Jerk")
+        ax_jerk.set_xlabel("time [s]")
+        ax_jerk.set_ylabel("jerk [m/s^3]")
+        ax_jerk.grid(True, alpha=0.25)
+        ax_jerk.legend(loc="best")
 
         status_lines = [
-            f"limit={initial_diag.limit_mps2:.2f} m/s^2",
             (
-                f"seed: {'PASS' if initial_diag.passes else 'FAIL'} "
-                f"(max={initial_diag.max_abs_augmented_lateral_accel_mps2:.2f})"
+                f"Seed Trajectory lat: {'PASS' if seed_diag.lateral_accel_passes else 'FAIL'} "
+                f"({seed_diag.max_abs_augmented_lateral_accel_mps2:.2f}/{seed_diag.lateral_accel_limit_mps2:.2f})"
+            ),
+            (
+                f"Seed Trajectory dv: {'PASS' if seed_diag.speed_gap_passes else 'FAIL'} "
+                f"({seed_diag.max_bridge_speed_gap_mps:.2f}/{seed_diag.speed_gap_limit_mps:.2f})"
+            ),
+            (
+                f"Seed Trajectory jerk: {'PASS' if seed_diag.jerk_passes else 'FAIL'} "
+                f"({seed_diag.max_abs_bridge_jerk_mps3:.2f}/{seed_diag.jerk_limit_mps3:.2f})"
             ),
         ]
-        if feasibility.adapted_result is not None and feasibility.adapted is not None:
+        status_lines.extend(
+            [
+                (
+                    f"Best Trajectory lat: {'PASS' if best_diag.lateral_accel_passes else 'FAIL'} "
+                    f"({best_diag.max_abs_augmented_lateral_accel_mps2:.2f}/{best_diag.lateral_accel_limit_mps2:.2f})"
+                ),
+                (
+                    f"Best Trajectory dv: {'PASS' if best_diag.speed_gap_passes else 'FAIL'} "
+                    f"({best_diag.max_bridge_speed_gap_mps:.2f}/{best_diag.speed_gap_limit_mps:.2f})"
+                ),
+                (
+                    f"Best Trajectory jerk: {'PASS' if best_diag.jerk_passes else 'FAIL'} "
+                    f"({best_diag.max_abs_bridge_jerk_mps3:.2f}/{best_diag.jerk_limit_mps3:.2f})"
+                ),
+            ]
+        )
+        if has_distinct_seed and feasibility is not None and feasibility.adaptation_strategy is not None:
             status_lines.append(
                 (
-                    f"{feasibility.adaptation_strategy}: "
-                    f"M={feasibility.adapted_result.past_connect_time_s:.1f}s, "
-                    f"N={feasibility.adapted_result.future_recover_time_s:.1f}s "
-                    f"(max={feasibility.adapted.max_abs_augmented_lateral_accel_mps2:.2f})"
+                    f"Best Trajectory via {feasibility.adaptation_strategy}: "
+                    f"Seed M={seed_result.past_connect_time_s:.1f}s, N={seed_result.future_recover_time_s:.1f}s; "
+                    f"Best M={best_result.past_connect_time_s:.1f}s, N={best_result.future_recover_time_s:.1f}s"
                 )
             )
-        elif feasibility.adaptation_strategy == "search disabled":
+        elif feasibility is not None and feasibility.adaptation_strategy == "search disabled":
             status_lines.append("adaptive search disabled")
-        elif not initial_diag.passes:
+        elif not seed_diag.passes:
             status_lines.append("no feasible candidate found within search range")
 
-        axes[3].text(
+        ax_jerk.text(
             0.02,
             0.98,
             "\n".join(status_lines),
-            transform=axes[3].transAxes,
+            transform=ax_jerk.transAxes,
             va="top",
             ha="left",
             fontsize=9.5,
             bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88, "edgecolor": "0.8"},
         )
     else:
-        axes[3].axis("off")
+        ax_lat.axis("off")
+        ax_gap.axis("off")
+        ax_jerk.axis("off")
 
-    end_delta = np.linalg.norm(
-        np.array([augmented.x[-1] - gt.x[-1], augmented.y[-1] - gt.y[-1]])
-    )
+    end_delta = np.linalg.norm(np.array([best.x[-1] - gt.x[-1], best.y[-1] - gt.y[-1]]))
     title_parts = [
-        f"pattern={result.pattern_name}",
-        f"offset={result.lateral_offset_m:+.2f} m",
-        f"yaw={np.degrees(result.heading_offset_rad):+.0f} deg",
-        f"M={result.past_connect_time_s:.1f} s",
-        f"N={result.future_recover_time_s:.1f} s",
+        f"pattern={best_result.pattern_name}",
+        f"offset={best_result.lateral_offset_m:+.2f} m",
+        f"yaw={np.degrees(best_result.heading_offset_rad):+.0f} deg",
+        f"M={best_result.past_connect_time_s:.1f} s",
+        f"N={best_result.future_recover_time_s:.1f} s",
         f"end_delta@8s={end_delta:.3f} m",
     ]
+    if has_distinct_seed:
+        title_parts.append(f"seed(M={seed_result.past_connect_time_s:.1f} s, N={seed_result.future_recover_time_s:.1f} s)")
     if feasibility is not None and not feasibility.initial.passes:
-        if feasibility.adapted_result is not None and feasibility.adapted_result is not result:
-            title_parts.append(
-                (
-                    f"{feasibility.adaptation_strategy}: "
-                    f"M*={feasibility.adapted_result.past_connect_time_s:.1f} s, "
-                    f"N*={feasibility.adapted_result.future_recover_time_s:.1f} s"
-                )
-            )
-        elif feasibility.adapted_result is result:
+        if feasibility.adaptation_strategy == "search disabled":
+            title_parts.append("feasibility search disabled")
+        elif has_distinct_seed:
             title_parts.append(f"selected via {feasibility.adaptation_strategy}")
-        elif feasibility.adaptation_strategy == "search disabled":
-            title_parts.append("lat-accel: adaptive search disabled")
         else:
-            title_parts.append("lat-accel: no feasible candidate in search range")
-    fig.suptitle(
-        ", ".join(title_parts),
-        fontsize=12,
-    )
+            title_parts.append("no feasible candidate in search range")
+    fig.suptitle(", ".join(title_parts), fontsize=12)
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
 
@@ -1249,6 +1669,8 @@ def run_demo(
     recover_time_s: float | None,
     past_connect_time_s: float | None,
     max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
     adaptive_bridge_search: bool,
 ) -> tuple[
     BidirectionalAugmentationResult,
@@ -1265,8 +1687,6 @@ def run_demo(
     initial_past_connect_time_s = (
         past_connect_time_s if past_connect_time_s is not None else MIN_BRIDGE_TIME_S
     )
-    auto_bridge_search = (recover_time_s is None) or (past_connect_time_s is None)
-
     initial_result = augment_trajectory_bidirectional(
         gt=gt,
         current_index=current_index,
@@ -1278,12 +1698,14 @@ def run_demo(
         output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
         pattern_name=pattern_name,
     )
-    feasibility = search_lateral_accel_feasible_result(
+    feasibility = search_feasible_result(
         initial_result=initial_result,
         max_lateral_accel_mps2=max_lateral_accel_mps2,
+        max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+        max_bridge_jerk_mps3=max_bridge_jerk_mps3,
     )
     result = initial_result
-    if adaptive_bridge_search and auto_bridge_search and feasibility.adapted_result is not None:
+    if adaptive_bridge_search and feasibility.adapted_result is not None:
         result = feasibility.adapted_result
     if not adaptive_bridge_search:
         feasibility = FeasibilitySearchDiagnostics(
@@ -1292,7 +1714,12 @@ def run_demo(
             adapted=None,
             adaptation_strategy="search disabled",
         )
-    make_demo_figure(result, output_path=output_path, feasibility=feasibility)
+    make_demo_figure(
+        result,
+        output_path=output_path,
+        feasibility=feasibility,
+        seed_result=initial_result,
+    )
     return result, feasibility, initial_recover_time_s, initial_past_connect_time_s
 
 
@@ -1305,6 +1732,8 @@ def run_sweep(
     recover_times: list[float],
     past_connect_times: list[float],
     max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
     adaptive_bridge_search: bool,
 ) -> list[Path]:
     gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
@@ -1326,10 +1755,15 @@ def run_sweep(
                         output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
                         pattern_name=pattern_name,
                     )
-                    feasibility = search_lateral_accel_feasible_result(
+                    feasibility = search_feasible_result(
                         initial_result=result,
                         max_lateral_accel_mps2=max_lateral_accel_mps2,
+                        max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+                        max_bridge_jerk_mps3=max_bridge_jerk_mps3,
                     )
+                    best_result = result
+                    if adaptive_bridge_search and feasibility.adapted_result is not None:
+                        best_result = feasibility.adapted_result
                     if not adaptive_bridge_search:
                         feasibility = FeasibilitySearchDiagnostics(
                             initial=feasibility.initial,
@@ -1345,7 +1779,12 @@ def run_sweep(
                         + format_time_suffix("M", past_connect_time_s)
                     )
                     output_path = output_prefix.with_name(f"{output_prefix.name}{suffix}.png")
-                    make_demo_figure(result, output_path=output_path, feasibility=feasibility)
+                    make_demo_figure(
+                        best_result,
+                        output_path=output_path,
+                        feasibility=feasibility,
+                        seed_result=result,
+                    )
                     output_paths.append(output_path)
 
     return output_paths
@@ -1383,9 +1822,21 @@ def main() -> None:
         help="Absolute lateral acceleration limit [m/s^2] used for diagnostics and adaptive bridge search.",
     )
     parser.add_argument(
+        "--max-bridge-speed-gap",
+        type=float,
+        default=0.5,
+        help="Maximum allowed exact-arc speed gap |v_aug - v_gt| inside the bridge windows [m/s].",
+    )
+    parser.add_argument(
+        "--max-bridge-jerk",
+        type=float,
+        default=5.0,
+        help="Maximum allowed longitudinal jerk magnitude inside the bridge windows [m/s^3].",
+    )
+    parser.add_argument(
         "--disable-adaptive-bridge-search",
         action="store_true",
-        help="Only diagnose lateral-acceleration limit violations without searching for a feasible M/N pair.",
+        help="Only diagnose the configured feasibility limits without searching for a feasible M/N pair.",
     )
     parser.add_argument("--write-pattern-csvs", action="store_true", help="Generate the CSV test patterns and exit.")
     parser.add_argument("--list-patterns", action="store_true", help="List available pattern names and exit.")
@@ -1428,6 +1879,8 @@ def main() -> None:
             recover_times=recover_times,
             past_connect_times=past_connect_times,
             max_lateral_accel_mps2=args.max_lateral_accel,
+            max_bridge_speed_gap_mps=args.max_bridge_speed_gap,
+            max_bridge_jerk_mps3=args.max_bridge_jerk,
             adaptive_bridge_search=not args.disable_adaptive_bridge_search,
         )
         print(f"Saved {len(output_paths)} sweep images for pattern: {args.pattern}")
@@ -1446,10 +1899,12 @@ def main() -> None:
         recover_time_s=args.recover_time,
         past_connect_time_s=args.past_connect_time,
         max_lateral_accel_mps2=args.max_lateral_accel,
+        max_bridge_speed_gap_mps=args.max_bridge_speed_gap,
+        max_bridge_jerk_mps3=args.max_bridge_jerk,
         adaptive_bridge_search=not args.disable_adaptive_bridge_search,
     )
 
-    gt_arc_speed, augmented_arc_speed = exact_arc_speed_in_window(result)
+    _, gt_arc_speed, augmented_arc_speed, _, _, _, augmented_jerk = exact_arc_kinematics_in_window(result)
     gt_chord_speed = chord_speed_from_trajectory(result.original_window)
     augmented_chord_speed = chord_speed_from_trajectory(result.augmented_window)
     arc_speed_abs_diff = float(np.max(np.abs(augmented_arc_speed - gt_arc_speed)))
@@ -1469,6 +1924,9 @@ def main() -> None:
             )
         )
     )
+    selected_diag = feasibility.initial
+    if feasibility.adapted_result is result and feasibility.adapted is not None:
+        selected_diag = feasibility.adapted
 
     print(f"Saved visualization to: {args.output}")
     print(f"Pattern: {result.pattern_name}")
@@ -1494,16 +1952,30 @@ def main() -> None:
     print(f"Max chord-speed abs diff vs GT in output window: {chord_speed_abs_diff:.3f} m/s")
     print(
         f"Max |lateral acceleration| in output window: "
-        f"{feasibility.initial.max_abs_augmented_lateral_accel_mps2:.3f} m/s^2 "
-        f"(limit {feasibility.initial.limit_mps2:.3f}, "
-        f"{'PASS' if feasibility.initial.passes else 'FAIL'})"
+        f"{selected_diag.max_abs_augmented_lateral_accel_mps2:.3f} m/s^2 "
+        f"(limit {selected_diag.lateral_accel_limit_mps2:.3f}, "
+        f"{'PASS' if selected_diag.lateral_accel_passes else 'FAIL'})"
+    )
+    print(
+        f"Max bridge speed gap |v_aug - v_gt|: "
+        f"{selected_diag.max_bridge_speed_gap_mps:.3f} m/s "
+        f"(limit {selected_diag.speed_gap_limit_mps:.3f}, "
+        f"{'PASS' if selected_diag.speed_gap_passes else 'FAIL'})"
+    )
+    print(
+        f"Max |bridge longitudinal jerk|: "
+        f"{selected_diag.max_abs_bridge_jerk_mps3:.3f} m/s^3 "
+        f"(limit {selected_diag.jerk_limit_mps3:.3f}, "
+        f"{'PASS' if selected_diag.jerk_passes else 'FAIL'})"
     )
     if feasibility.adapted_result is not None and feasibility.adapted is not None:
         print(
             f"Lowest passing candidate via {feasibility.adaptation_strategy}: "
             f"M={feasibility.adapted_result.past_connect_time_s:.2f} s, "
             f"N={feasibility.adapted_result.future_recover_time_s:.2f} s, "
-            f"max |a_lat|={feasibility.adapted.max_abs_augmented_lateral_accel_mps2:.3f} m/s^2"
+            f"max |a_lat|={feasibility.adapted.max_abs_augmented_lateral_accel_mps2:.3f} m/s^2, "
+            f"max dv={feasibility.adapted.max_bridge_speed_gap_mps:.3f} m/s, "
+            f"max |jerk|={feasibility.adapted.max_abs_bridge_jerk_mps3:.3f} m/s^3"
         )
     elif feasibility.adaptation_strategy == "search disabled":
         print("Adaptive bridge search disabled.")
@@ -1511,6 +1983,7 @@ def main() -> None:
         print("No feasible M/N candidate found within the available full GT horizon.")
     print(f"End delta at +8s: {end_delta:.3f} m")
     print(f"Max |curvature| in output window: {float(np.max(np.abs(curvature))):.4f} 1/m")
+    print(f"Max |selected longitudinal jerk| in output window: {float(np.max(np.abs(augmented_jerk))):.3f} m/s^3")
 
 
 if __name__ == "__main__":

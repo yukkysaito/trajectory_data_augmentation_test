@@ -6,6 +6,7 @@ The augmentation simulates lateral tracking or localization errors by shifting t
 
 - a past bridge that smoothly connects the original past trajectory to the offset state over `M` seconds
 - a future bridge that smoothly returns from the offset state to the original GT trajectory over `N` seconds
+- once the bridge ends, the trajectory follows the original GT again
 
 The implementation is designed to avoid two common failure modes:
 
@@ -44,32 +45,37 @@ and these speed profiles:
 - `constant`
 - `decelerating`
 - `accelerating`
+- `stopping`
+- `stop8s`
 
-This gives 9 combinations in total, for example:
+This gives 15 combinations in total, for example:
 
 - `straight_constant.csv`
 - `curve_decelerating.csv`
 - `s_curve_accelerating.csv`
+- `straight_stopping.csv`
+- `straight_stop8s.csv`
 
 ## Main Idea
 
 The GT trajectory is treated as a centerline. The augmented path is constructed in a Frenet-like manner:
 
-- the lateral offset decays with a monotonic quintic profile
-- the merge point on the GT is adjusted if needed so the augmented path does not require higher speed than the original GT
+- the lateral offset is generated with a monotonic quintic bridge along the GT centerline
+- the bridge is merged to an earlier point on the GT centerline if needed so that no catch-up acceleration is required
+- after the merge time, the augmented trajectory follows the GT speed as a function of centerline progress, so a longer bridge naturally appears as a delayed speed profile in time
 - the same logic is applied backward in time for the past bridge
 
-This keeps the path smooth while preserving feasible longitudinal progress.
+This keeps the path smooth while avoiding forced catch-up after the bridge. If the augmented path is longer, the vehicle stays behind in progress instead of accelerating to match the GT at the same absolute timestamp.
 
-## Lateral Acceleration Feasibility
+## Bridge Feasibility
 
-The repository also evaluates lateral acceleration in the output window:
+The repository evaluates three feasibility constraints:
 
 - `a_lat = v^2 * kappa`
-- `v` is taken from the exact arc-length progress used by the augmentation logic
-- `kappa` is computed from the final sampled trajectory
+- bridge speed gap: `|v_aug - v_gt|`
+- bridge longitudinal jerk: `|dj/dt|`
 
-If a requested augmentation exceeds `--max-lateral-accel`, the visualization highlights the violation and also searches for the lowest passing bridge-time candidate:
+If a requested augmentation exceeds any configured limit, the visualization highlights the violation and also searches for the lowest passing bridge-time candidate:
 
 1. find the minimum feasible `N`
 2. if that is still insufficient, find the minimum feasible pair `(M, N)`
@@ -80,7 +86,7 @@ When `--recover-time` and `--past-connect-time` are omitted, the demo starts fro
 
 - `diffusion_planner_augmentation.py`: augmentation implementation, CSV pattern generation/loading, visualization utilities, and CLI
 - `test_patterns/*.csv`: trajectory test patterns
-- `tests/test_augmentation.py`: unit tests for continuity, speed feasibility, horizon handling, and curvature bounds
+- `tests/test_augmentation.py`: unit tests for continuity, merge behavior, feasibility search, horizon handling, and curvature bounds
 
 ## Requirements
 
@@ -109,15 +115,19 @@ python3 diffusion_planner_augmentation.py \
   --recover-time 1.5 \
   --past-connect-time 1.0 \
   --max-lateral-accel 3.0 \
+  --max-bridge-speed-gap 0.5 \
+  --max-bridge-jerk 5.0 \
   --output augmentation_demo.png
 ```
 
-This generates a 4-panel figure with:
+This generates a 6-panel figure with:
 
 - trajectory
 - speed
 - curvature
 - lateral acceleration
+- bridge speed gap
+- bridge longitudinal jerk
 
 The trajectory panel shows:
 
@@ -125,7 +135,7 @@ The trajectory panel shows:
 - the actual `[-3 s, +8 s]` output window
 - a triangle marker at every `0.1 s` pose for both GT and augmented trajectories, so temporal spacing and heading are visible
 
-The lateral-acceleration panel shows:
+The feasibility panels show:
 
 - GT lateral acceleration
 - the requested augmentation, or the auto-search seed if `M/N` were omitted
@@ -140,6 +150,8 @@ python3 diffusion_planner_augmentation.py \
   --offset 3.0 \
   --yaw-offset-deg 10.0 \
   --max-lateral-accel 3.0 \
+  --max-bridge-speed-gap 0.5 \
+  --max-bridge-jerk 5.0 \
   --output augmentation_demo_auto_bridge.png
 ```
 
@@ -180,18 +192,19 @@ python3 -m unittest discover -s tests -v
 
 The test suite checks:
 
-- all 9 CSV patterns can be generated and loaded
+- all 15 CSV patterns can be generated and loaded
 - the full GT horizon is `[-5 s, +10 s]`
 - the output window is `[-3 s, +8 s]`
+- the augmented future follows GT speed at the corresponding centerline progress after the merge time
 - recovery pose consistency with the intended merge point
-- no speed overshoot during the past and future bridge windows
 - continuity at `t0`
 - bounded curvature and curvature variation
-- visible endpoint lag at `+8 s` for a representative large-offset case
-- lateral-acceleration feasibility search for both the `N-only` and `(M, N)` fallback paths
+- endpoint lag at `+8 s` for representative large-offset cases
+- composite feasibility search for both the `N-only` and `(M, N)` fallback paths
+- stopping-pattern behavior under progress-based speed matching
 
 ## Notes
 
-- Depending on the sign of the lateral offset and local curvature, the augmented path can be either longer or shorter than the original local GT path.
-- If the augmented bridge is longer, the implementation delays the merge point on the GT rather than demanding infeasible speed.
-- Because the visualization focuses on the `[-3 s, +8 s]` output window, the endpoint difference at `+8 s` is directly visible in the demo figures.
+- The feasibility search currently uses sampled trajectory kinematics inside the bridge windows rather than a full vehicle model.
+- Low-speed or stopping patterns are supported as synthetic test cases, but if the GT fully stops within the output horizon, preserving the GT speed profile can leave the augmented stop pose short of the original stop point.
+- No steering-rate or tire-force limits are modeled yet.
