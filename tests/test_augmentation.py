@@ -373,6 +373,31 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
         self.assertGreater(float(augmented_speed[terminal_index]), float(gt_speed[terminal_index]) + 5.0e-3)
         self.assertLess(float(result.augmented_window.x[terminal_index]), float(result.original_window.x[terminal_index]) - 0.2)
 
+    def test_stop8s_longer_recovery_keeps_positive_terminal_lag(self) -> None:
+        gt, current_index = load_test_pattern("straight_stop8s", DEFAULT_PATTERN_DIR)
+        result = augment_trajectory_bidirectional(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=4.0,
+            heading_offset_rad=np.deg2rad(10.0),
+            future_recover_time_s=2.0,
+            past_connect_time_s=1.0,
+            pattern_name="straight_stop8s",
+        )
+
+        gt_speed, augmented_speed = exact_arc_speed_in_window(result)
+        terminal_index = int(np.argmin(np.abs(result.original_window.t - OUTPUT_FUTURE_HORIZON_S)))
+        end_delta = np.linalg.norm(
+            np.array(
+                [
+                    result.augmented_window.x[-1] - result.original_window.x[-1],
+                    result.augmented_window.y[-1] - result.original_window.y[-1],
+                ]
+            )
+        )
+        self.assertGreater(float(end_delta), 1.0e-3)
+        self.assertGreater(float(augmented_speed[terminal_index]), float(gt_speed[terminal_index]) + 1.0e-3)
+
 
 if __name__ == "__main__":
     unittest.main()
