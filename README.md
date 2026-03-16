@@ -6,41 +6,25 @@ The augmentation simulates lateral tracking or localization errors by shifting t
 
 - a past bridge that smoothly connects the original past trajectory to the offset state over `M` seconds
 - a future bridge that smoothly returns from the offset state to the original GT trajectory over `N` seconds
-- once the bridge ends, the trajectory follows the original GT again
-
-The implementation is designed to avoid two common failure modes:
-
-- speed inconsistency caused by forcing the augmented path to reach an infeasible GT point in the same amount of time
-- oscillatory trajectories caused by naive interpolation
 
 ## Horizon Setup
 
-The repository now uses two different horizons:
-
 - full GT context: past `5 s`, future `10 s`
-- actual augmented output window: past `3 s`, future `8 s`
+- augmented output window: past `3 s`, future `8 s`
 
-The augmentation is computed on the full GT trajectory so that cases with longer augmented paths still have extra trajectory context available. The final training-style output and the main visualization focus on the `[-3 s, +8 s]` window.
+The augmentation is computed on the full GT trajectory so larger offsets still have extra context available. The main plots focus on the `[-3 s, +8 s]` window.
 
 ## Test Pattern CSVs
 
-Trajectory patterns are stored as CSV files under `test_patterns/`.
+Trajectory patterns are stored under `test_patterns/`.
 
-Each CSV contains:
-
-- `t`
-- `x`
-- `y`
-- `yaw`
-- `speed_mps`
-
-The repository supports these geometry patterns:
+Supported geometry patterns:
 
 - `straight`
 - `curve`
 - `s_curve`
 
-and these speed profiles:
+Supported speed profiles:
 
 - `constant`
 - `decelerating`
@@ -48,51 +32,29 @@ and these speed profiles:
 - `stopping`
 - `stop8s`
 
-This gives 15 combinations in total, for example:
+This gives 15 combinations such as:
 
 - `straight_constant.csv`
 - `curve_decelerating.csv`
-- `s_curve_accelerating.csv`
-- `straight_stopping.csv`
 - `straight_stop8s.csv`
+- `s_curve_accelerating.csv`
 
-## Main Idea
+## Package Layout
 
-The GT trajectory is treated as a centerline. The augmented path is constructed in a Frenet-like manner:
+The code is now split into reusable modules:
 
-- the lateral offset is generated with a monotonic quintic bridge along the GT centerline
-- the bridge is merged to an earlier point on the GT centerline if needed so that no catch-up acceleration is required
-- after the merge time, the augmented trajectory follows the GT speed as a function of centerline progress, so a longer bridge naturally appears as a delayed speed profile in time
-- the same logic is applied backward in time for the past bridge
+- `trajectory_augmentation/core.py`: augmentation logic, CSV I/O, diagnostics, reusable case runner
+- `trajectory_augmentation/visualization.py`: Plotly figure builders
+- `trajectory_augmentation/cli.py`: command-line entrypoint and sweep rendering
+- `diffusion_planner_augmentation.py`: backward-compatible wrapper script
 
-This keeps the path smooth while avoiding forced catch-up after the bridge. If the augmented path is longer, the vehicle stays behind in progress instead of accelerating to match the GT at the same absolute timestamp.
-
-## Bridge Feasibility
-
-The repository evaluates three feasibility constraints:
-
-- `a_lat = v^2 * kappa`
-- bridge speed gap: `|v_aug - v_gt|`
-- bridge longitudinal jerk: `|dj/dt|`
-
-If a requested augmentation exceeds any configured limit, the visualization highlights the violation and also searches for the lowest passing bridge-time candidate:
-
-1. find the minimum feasible `N`
-2. if that is still insufficient, find the minimum feasible pair `(M, N)`
-
-When `--recover-time` and `--past-connect-time` are omitted, the demo starts from an auto-search seed of `0.1 s` and directly selects the lowest feasible bridge times it can find within the available full GT horizon.
-
-## Files
-
-- `diffusion_planner_augmentation.py`: augmentation implementation, CSV pattern generation/loading, visualization utilities, and CLI
-- `test_patterns/*.csv`: trajectory test patterns
-- `tests/test_augmentation.py`: unit tests for continuity, merge behavior, feasibility search, horizon handling, and curvature bounds
+This makes it easier to reuse the augmentation logic and visualization helpers from other repositories such as `Diffusion-Planner`.
 
 ## Requirements
 
 - Python 3.10+
 - `numpy`
-- `matplotlib`
+- `plotly`
 
 ## Write the CSV Pattern Files
 
@@ -106,7 +68,7 @@ python3 diffusion_planner_augmentation.py --write-pattern-csvs
 python3 diffusion_planner_augmentation.py --list-patterns
 ```
 
-## Run a Single Example
+## Run a Single Interactive Example
 
 ```bash
 python3 diffusion_planner_augmentation.py \
@@ -115,32 +77,10 @@ python3 diffusion_planner_augmentation.py \
   --recover-time 1.5 \
   --past-connect-time 1.0 \
   --max-lateral-accel 3.0 \
-  --max-bridge-speed-gap 0.5 \
-  --max-bridge-jerk 5.0 \
-  --output augmentation_demo.png
+  --output augmentation_demo.html
 ```
 
-This generates a 6-panel figure with:
-
-- trajectory
-- speed
-- curvature
-- lateral acceleration
-- bridge speed gap
-- bridge longitudinal jerk
-
-The trajectory panel shows:
-
-- full GT context in light gray
-- the actual `[-3 s, +8 s]` output window
-- a triangle marker at every `0.1 s` pose for both GT and augmented trajectories, so temporal spacing and heading are visible
-
-The feasibility panels show:
-
-- GT lateral acceleration
-- the requested augmentation, or the auto-search seed if `M/N` were omitted
-- red markers where the requested trajectory exceeds the limit
-- the lowest passing candidate, if one is found
+The HTML output uses Plotly, so you can zoom, pan, hide traces from the legend, and inspect points with hover tooltips.
 
 ## Run a Single Example With Automatic Bridge-Time Search
 
@@ -150,9 +90,7 @@ python3 diffusion_planner_augmentation.py \
   --offset 3.0 \
   --yaw-offset-deg 10.0 \
   --max-lateral-accel 3.0 \
-  --max-bridge-speed-gap 0.5 \
-  --max-bridge-jerk 5.0 \
-  --output augmentation_demo_auto_bridge.png
+  --output augmentation_demo_auto_bridge.html
 ```
 
 In this mode:
@@ -161,7 +99,7 @@ In this mode:
 - it first searches for the minimum feasible `N`
 - if that still fails, it searches for the minimum feasible `(M, N)` pair
 
-If you want a fixed `M/N` visualization with diagnostics only, keep `--recover-time` and `--past-connect-time` explicitly set.
+If you want fixed `M/N` values with diagnostics only, keep `--recover-time` and `--past-connect-time` explicitly set.
 
 ## Run the Full Sweep
 
@@ -172,17 +110,61 @@ python3 diffusion_planner_augmentation.py \
   --output-prefix augmentation_demo
 ```
 
-This generates one figure per parameter combination using:
+This generates one Plotly HTML per parameter combination using:
 
 - `offset = [-3, -2, -1, +1, +2, +3] m`
 - `N = [0.5, 1.0, 1.5, 2.0] s`
 - `M = [0.5, 1.0, 1.5, 2.0] s`
 
-That results in 96 images for the selected pattern, with filenames like:
+## Reusable Python API
 
-- `augmentation_demo_curve_decelerating_offsetm3p0m_N0p5s_M0p5s.png`
-- `augmentation_demo_curve_decelerating_offsetp1p0m_N1p5s_M1p0s.png`
-- `augmentation_demo_curve_decelerating_offsetp3p0m_N2p0s_M2p0s.png`
+Example:
+
+```python
+from pathlib import Path
+
+from trajectory_augmentation import run_demo_case, write_plotly_demo_figure
+
+artifacts = run_demo_case(
+    pattern_name="curve_decelerating",
+    pattern_dir=Path("test_patterns"),
+    seed=7,
+    offset_m=2.0,
+    yaw_offset_deg=5.0,
+    recover_time_s=1.5,
+    past_connect_time_s=1.0,
+    max_lateral_accel_mps2=3.0,
+    adaptive_bridge_search=True,
+)
+
+write_plotly_demo_figure(artifacts, Path("demo.html"))
+```
+
+`run_demo_case(...)` returns a `DemoArtifacts` object containing:
+
+- the seed trajectory result
+- the best trajectory result
+- feasibility diagnostics
+- the initial `M/N` values used for the run
+
+## Diagnostics
+
+The implementation evaluates lateral acceleration in the output window:
+
+- `a_lat = v^2 * kappa`
+- `v` comes from the exact arc-length progress used by the augmentation logic
+- `kappa` is computed from the sampled trajectory
+
+The plots show:
+
+- GT trajectory context
+- seed trajectory
+- best trajectory
+- best-trajectory offset point and merge points
+- best-trajectory pose triangles at 0.1 s spacing
+- exact-arc and chord-based speed
+- curvature
+- lateral acceleration and feasibility status
 
 ## Run Tests
 
@@ -192,19 +174,13 @@ python3 -m unittest discover -s tests -v
 
 The test suite checks:
 
-- all 15 CSV patterns can be generated and loaded
+- all 9 CSV patterns can be generated and loaded
 - the full GT horizon is `[-5 s, +10 s]`
 - the output window is `[-3 s, +8 s]`
-- the augmented future follows GT speed at the corresponding centerline progress after the merge time
-- recovery pose consistency with the intended merge point
+- recovery pose consistency with the merge point
+- no speed overshoot during the bridge windows
 - continuity at `t0`
 - bounded curvature and curvature variation
-- endpoint lag at `+8 s` for representative large-offset cases
-- composite feasibility search for both the `N-only` and `(M, N)` fallback paths
-- stopping-pattern behavior under progress-based speed matching
-
-## Notes
-
-- The feasibility search currently uses sampled trajectory kinematics inside the bridge windows rather than a full vehicle model.
-- Low-speed or stopping patterns are supported as synthetic test cases, but if the GT fully stops within the output horizon, preserving the GT speed profile can leave the augmented stop pose short of the original stop point.
-- No steering-rate or tire-force limits are modeled yet.
+- visible endpoint lag at `+8 s` for a representative large-offset case
+- lateral-acceleration feasibility search behavior
+- reusable API and Plotly HTML output
