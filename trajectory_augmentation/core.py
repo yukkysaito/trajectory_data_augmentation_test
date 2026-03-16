@@ -43,6 +43,7 @@ class Centerline:
     x: np.ndarray
     y: np.ndarray
     yaw: np.ndarray
+    curvature: np.ndarray
 
 
 @dataclass
@@ -51,6 +52,19 @@ class DensePath:
     x: np.ndarray
     y: np.ndarray
     yaw: np.ndarray
+
+
+@dataclass
+class PreparedDirectedSegment:
+    segment: Trajectory2D
+    centerline: Centerline
+    distance_profile: np.ndarray
+    progress_time_samples: np.ndarray
+    progress_time_lookup: np.ndarray
+    total_distance_m: float
+    dense_ds: float
+    gt_exact_speed_profile: np.ndarray
+    gt_longitudinal_jerk_profile: np.ndarray
 
 
 @dataclass
@@ -141,6 +155,26 @@ class DemoArtifacts:
     adaptive_bridge_search: bool
 
 
+@dataclass
+class BidirectionalAugmentationContext:
+    original_full: Trajectory2D
+    original_past: Trajectory2D
+    original_future: Trajectory2D
+    original_window: Trajectory2D
+    current_index: int
+    window_start_index: int
+    window_end_index: int
+    future_segment: PreparedDirectedSegment
+    past_segment: PreparedDirectedSegment
+    pattern_name: str
+    past_window_size: int
+    future_window_size: int
+    gt_window_arc_speed: np.ndarray
+    gt_window_curvature: np.ndarray
+    gt_window_lateral_accel: np.ndarray
+    gt_window_longitudinal_jerk: np.ndarray
+
+
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
@@ -177,6 +211,22 @@ def heading_from_xy(x: np.ndarray, y: np.ndarray, param: np.ndarray) -> np.ndarr
     dx = np.gradient(x, param, edge_order=2)
     dy = np.gradient(y, param, edge_order=2)
     return np.unwrap(np.arctan2(dy, dx))
+
+
+def dense_heading_from_xy(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    if len(x) < 3:
+        if len(x) == 0:
+            return np.array([], dtype=float)
+        if len(x) == 1:
+            return np.array([0.0], dtype=float)
+        yaw = np.arctan2(y[1] - y[0], x[1] - x[0])
+        return np.array([yaw, yaw], dtype=float)
+
+    yaw = np.empty_like(x, dtype=float)
+    yaw[0] = np.arctan2(y[1] - y[0], x[1] - x[0])
+    yaw[-1] = np.arctan2(y[-1] - y[-2], x[-1] - x[-2])
+    yaw[1:-1] = np.arctan2(y[2:] - y[:-2], x[2:] - x[:-2])
+    return np.unwrap(yaw)
 
 
 def curvature_from_xy(x: np.ndarray, y: np.ndarray, param: np.ndarray) -> np.ndarray:
@@ -480,7 +530,208 @@ def build_centerline(segment: Trajectory2D, dense_ds: float = 0.05) -> Centerlin
     dense_x = np.interp(dense_s, s_samples, segment.x)
     dense_y = np.interp(dense_s, s_samples, segment.y)
     dense_yaw = np.interp(dense_s, s_samples, yaw_samples)
-    return Centerline(s=dense_s, x=dense_x, y=dense_y, yaw=dense_yaw)
+    if len(dense_s) >= 3:
+        dense_curvature = np.gradient(dense_yaw, dense_s, edge_order=2)
+    else:
+        dense_curvature = np.zeros_like(dense_s, dtype=float)
+    return Centerline(s=dense_s, x=dense_x, y=dense_y, yaw=dense_yaw, curvature=dense_curvature)
+
+
+def infer_dense_ds(samples: np.ndarray, fallback: float = 0.05) -> float:
+    if len(samples) < 2:
+        return fallback
+    return float(samples[1] - samples[0])
+
+
+def build_longitudinal_gt_profiles(
+    distance_profile: np.ndarray,
+    time: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    gt_exact_speed_profile = speed_from_progress(distance_profile, time)
+    gt_acceleration_profile = acceleration_from_speed(gt_exact_speed_profile, time)
+    gt_longitudinal_jerk_profile = jerk_from_acceleration(gt_acceleration_profile, time)
+    return gt_exact_speed_profile, gt_longitudinal_jerk_profile
+
+
+def make_prepared_directed_segment(
+    segment: Trajectory2D,
+    centerline: Centerline,
+    distance_profile: np.ndarray,
+    dense_ds: float,
+) -> PreparedDirectedSegment:
+    progress_time_samples, progress_time_lookup = build_progress_time_lookup(distance_profile, segment.t)
+    gt_exact_speed_profile, gt_longitudinal_jerk_profile = build_longitudinal_gt_profiles(
+        distance_profile=distance_profile,
+        time=segment.t,
+    )
+    return PreparedDirectedSegment(
+        segment=segment,
+        centerline=centerline,
+        distance_profile=distance_profile,
+        progress_time_samples=progress_time_samples,
+        progress_time_lookup=progress_time_lookup,
+        total_distance_m=float(distance_profile[-1]),
+        dense_ds=dense_ds,
+        gt_exact_speed_profile=gt_exact_speed_profile,
+        gt_longitudinal_jerk_profile=gt_longitudinal_jerk_profile,
+    )
+
+
+def prepare_directed_segment(segment: Trajectory2D, dense_ds: float = 0.05) -> PreparedDirectedSegment:
+    distance_profile = cumulative_distance(segment.x, segment.y)
+    return make_prepared_directed_segment(
+        segment=segment,
+        centerline=build_centerline(segment, dense_ds=dense_ds),
+        distance_profile=distance_profile,
+        dense_ds=dense_ds,
+    )
+
+
+def prepared_segment_from_result(result: SegmentAugmentationResult) -> PreparedDirectedSegment:
+    return make_prepared_directed_segment(
+        segment=result.original_segment,
+        centerline=result.centerline,
+        distance_profile=result.distance_profile,
+        dense_ds=infer_dense_ds(result.centerline.s),
+    )
+
+
+def build_window_gt_metrics(
+    original_window: Trajectory2D,
+    future_segment: PreparedDirectedSegment,
+    past_segment: PreparedDirectedSegment,
+    window_start_index: int,
+    window_end_index: int,
+    current_index: int,
+) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    past_window_size = current_index - window_start_index + 1
+    future_window_size = window_end_index - current_index + 1
+
+    past_gt_speed = past_segment.gt_exact_speed_profile[::-1]
+    future_gt_speed = future_segment.gt_exact_speed_profile
+    gt_full_speed = np.concatenate((past_gt_speed[:-1], future_gt_speed))
+    gt_window_arc_speed = gt_full_speed[window_start_index : window_end_index + 1]
+
+    gt_window_sigma = cumulative_distance(original_window.x, original_window.y)
+    gt_window_curvature = curvature_from_xy(
+        original_window.x,
+        original_window.y,
+        gt_window_sigma,
+    )
+    gt_window_lateral_accel = lateral_acceleration_from_speed_and_curvature(
+        gt_window_arc_speed,
+        gt_window_curvature,
+    )
+
+    past_gt_jerk = past_segment.gt_longitudinal_jerk_profile[::-1]
+    future_gt_jerk = future_segment.gt_longitudinal_jerk_profile
+    gt_full_jerk = np.concatenate((past_gt_jerk[:-1], future_gt_jerk))
+    gt_window_longitudinal_jerk = gt_full_jerk[window_start_index : window_end_index + 1]
+    return (
+        past_window_size,
+        future_window_size,
+        gt_window_arc_speed,
+        gt_window_curvature,
+        gt_window_lateral_accel,
+        gt_window_longitudinal_jerk,
+    )
+
+
+def make_bidirectional_context(
+    original_full: Trajectory2D,
+    original_past: Trajectory2D,
+    original_future: Trajectory2D,
+    original_window: Trajectory2D,
+    current_index: int,
+    window_start_index: int,
+    window_end_index: int,
+    future_segment: PreparedDirectedSegment,
+    past_segment: PreparedDirectedSegment,
+    pattern_name: str,
+) -> BidirectionalAugmentationContext:
+    (
+        past_window_size,
+        future_window_size,
+        gt_window_arc_speed,
+        gt_window_curvature,
+        gt_window_lateral_accel,
+        gt_window_longitudinal_jerk,
+    ) = build_window_gt_metrics(
+        original_window=original_window,
+        future_segment=future_segment,
+        past_segment=past_segment,
+        window_start_index=window_start_index,
+        window_end_index=window_end_index,
+        current_index=current_index,
+    )
+    return BidirectionalAugmentationContext(
+        original_full=original_full,
+        original_past=original_past,
+        original_future=original_future,
+        original_window=original_window,
+        current_index=current_index,
+        window_start_index=window_start_index,
+        window_end_index=window_end_index,
+        future_segment=future_segment,
+        past_segment=past_segment,
+        pattern_name=pattern_name,
+        past_window_size=past_window_size,
+        future_window_size=future_window_size,
+        gt_window_arc_speed=gt_window_arc_speed,
+        gt_window_curvature=gt_window_curvature,
+        gt_window_lateral_accel=gt_window_lateral_accel,
+        gt_window_longitudinal_jerk=gt_window_longitudinal_jerk,
+    )
+
+
+def build_bidirectional_context(
+    gt: Trajectory2D,
+    current_index: int,
+    pattern_name: str,
+    dense_ds: float = 0.05,
+    output_past_horizon_s: float = OUTPUT_PAST_HORIZON_S,
+    output_future_horizon_s: float = OUTPUT_FUTURE_HORIZON_S,
+) -> BidirectionalAugmentationContext:
+    future_segment = extract_future_segment(gt, current_index)
+    past_reverse_segment = extract_reversed_past_segment(gt, current_index)
+    original_past = gt.slice(0, current_index + 1)
+    original_future = gt.slice(current_index, None)
+    original_window, window_start_index, window_end_index = extract_time_window(
+        gt,
+        start_time_s=-output_past_horizon_s,
+        end_time_s=output_future_horizon_s,
+    )
+    prepared_future_segment = prepare_directed_segment(future_segment, dense_ds=dense_ds)
+    prepared_past_segment = prepare_directed_segment(past_reverse_segment, dense_ds=dense_ds)
+    return make_bidirectional_context(
+        original_full=gt,
+        original_past=original_past,
+        original_future=original_future,
+        original_window=original_window,
+        current_index=current_index,
+        window_start_index=window_start_index,
+        window_end_index=window_end_index,
+        future_segment=prepared_future_segment,
+        past_segment=prepared_past_segment,
+        pattern_name=pattern_name,
+    )
+
+
+def build_bidirectional_context_from_result(result: BidirectionalAugmentationResult) -> BidirectionalAugmentationContext:
+    future_segment = prepared_segment_from_result(result.future_segment)
+    past_segment = prepared_segment_from_result(result.past_segment)
+    return make_bidirectional_context(
+        original_full=result.original_full,
+        original_past=result.original_past,
+        original_future=result.original_future,
+        original_window=result.original_window,
+        current_index=result.current_index,
+        window_start_index=result.window_start_index,
+        window_end_index=result.window_end_index,
+        future_segment=future_segment,
+        past_segment=past_segment,
+        pattern_name=result.pattern_name,
+    )
 
 
 def sample_centerline(centerline: Centerline, s_query: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -491,62 +742,66 @@ def sample_centerline(centerline: Centerline, s_query: np.ndarray) -> tuple[np.n
     return x, y, yaw
 
 
-def quintic_decay(unit_s: np.ndarray) -> np.ndarray:
-    u = np.clip(unit_s, 0.0, 1.0)
-    return 1.0 - 10.0 * u**3 + 15.0 * u**4 - 6.0 * u**5
-
-
-def solve_lateral_profile_coeffs(
-    s_merge: float,
-    lateral_offset_m: float,
-    heading_offset_rad: float,
-) -> np.ndarray:
-    if s_merge <= 0.0:
-        raise ValueError("s_merge must be positive.")
-
-    # Use a quintic profile in arc length so the path can satisfy:
-    # l(0), l'(0), l''(0), l(L), l'(L), l''(L).
-    #
-    # l'(0) controls the initial heading error. For small offsets on a smooth
-    # centerline, heading error is approximately atan(l'(0)).
-    L = float(s_merge)
-    a0 = float(lateral_offset_m)
-    a1 = float(np.tan(heading_offset_rad))
-    a2 = 0.0
-
-    system = np.array(
-        [
-            [L**3, L**4, L**5],
-            [3.0 * L**2, 4.0 * L**3, 5.0 * L**4],
-            [6.0 * L, 12.0 * L**2, 20.0 * L**3],
-        ],
-        dtype=float,
-    )
-    rhs = np.array(
-        [
-            -(a0 + a1 * L + a2 * L**2),
-            -(a1 + 2.0 * a2 * L),
-            -(2.0 * a2),
-        ],
-        dtype=float,
-    )
-    a3, a4, a5 = np.linalg.solve(system, rhs)
-    return np.array([a0, a1, a2, a3, a4, a5], dtype=float)
-
-
 def lateral_offset_profile(
     s: np.ndarray,
     s_merge: float,
     lateral_offset_m: float,
     heading_offset_rad: float = 0.0,
 ) -> np.ndarray:
-    coeffs = solve_lateral_profile_coeffs(
-        s_merge=s_merge,
-        lateral_offset_m=lateral_offset_m,
+    if s_merge <= 0.0:
+        raise ValueError("s_merge must be positive.")
+
+    unit_s = np.clip(s / s_merge, 0.0, 1.0)
+    offset_basis = 1.0 - 10.0 * unit_s**3 + 15.0 * unit_s**4 - 6.0 * unit_s**5
+    heading_basis = unit_s - 6.0 * unit_s**3 + 8.0 * unit_s**4 - 3.0 * unit_s**5
+    return lateral_offset_m * offset_basis + np.tan(heading_offset_rad) * s_merge * heading_basis
+
+
+def lateral_offset_profile_derivative(
+    s: np.ndarray,
+    s_merge: float,
+    lateral_offset_m: float,
+    heading_offset_rad: float = 0.0,
+) -> np.ndarray:
+    if s_merge <= 0.0:
+        raise ValueError("s_merge must be positive.")
+
+    unit_s = np.clip(s / s_merge, 0.0, 1.0)
+    offset_basis_prime = (-30.0 * unit_s**2 + 60.0 * unit_s**3 - 30.0 * unit_s**4) / s_merge
+    heading_basis_prime = 1.0 - 18.0 * unit_s**2 + 32.0 * unit_s**3 - 15.0 * unit_s**4
+    return lateral_offset_m * offset_basis_prime + np.tan(heading_offset_rad) * heading_basis_prime
+
+
+def merge_path_length(
+    centerline: Centerline,
+    s_merge: float,
+    lateral_offset_m: float,
+    heading_offset_rad: float = 0.0,
+    dense_ds: float = 0.05,
+) -> float:
+    if s_merge <= 0.0:
+        raise ValueError("s_merge must be positive.")
+
+    s_segment = np.arange(0.0, s_merge, dense_ds)
+    if len(s_segment) == 0 or abs(s_segment[-1] - s_merge) > 1.0e-12:
+        s_segment = np.append(s_segment, s_merge)
+
+    curvature = np.interp(s_segment, centerline.s, centerline.curvature)
+    offset = lateral_offset_profile(
+        s_segment,
+        s_merge,
+        lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
     )
-    powers = np.stack([s**idx for idx in range(6)], axis=-1)
-    return powers @ coeffs
+    offset_prime = lateral_offset_profile_derivative(
+        s_segment,
+        s_merge,
+        lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
+    )
+    integrand = np.sqrt(np.maximum((1.0 - curvature * offset) ** 2 + offset_prime * offset_prime, 1.0e-12))
+    ds = np.diff(s_segment)
+    return float(np.sum(0.5 * (integrand[:-1] + integrand[1:]) * ds))
 
 
 def build_merge_path(
@@ -560,7 +815,7 @@ def build_merge_path(
         raise ValueError("s_merge must be positive.")
 
     s_segment = np.arange(0.0, s_merge, dense_ds)
-    if len(s_segment) == 0 or not np.isclose(s_segment[-1], s_merge):
+    if len(s_segment) == 0 or abs(s_segment[-1] - s_merge) > 1.0e-12:
         s_segment = np.append(s_segment, s_merge)
 
     base_x, base_y, base_yaw = sample_centerline(centerline, s_segment)
@@ -576,7 +831,7 @@ def build_merge_path(
     x = base_x + offset * normal_x
     y = base_y + offset * normal_y
     sigma = cumulative_distance(x, y)
-    yaw = heading_from_xy(x, y, sigma)
+    yaw = dense_heading_from_xy(x, y)
     return DensePath(sigma=sigma, x=x, y=y, yaw=yaw)
 
 
@@ -588,27 +843,26 @@ def solve_merge_centerline_s(
     dense_ds: float = 0.05,
     tol_m: float = 1.0e-3,
 ) -> tuple[float, DensePath]:
+    upper = min(distance_budget_m, centerline.s[-1])
     if abs(lateral_offset_m) < 1.0e-9 and abs(heading_offset_rad) < 1.0e-9:
-        merge_path = build_merge_path(
+        return distance_budget_m, build_merge_path(
             centerline,
             distance_budget_m,
             lateral_offset_m,
             heading_offset_rad=heading_offset_rad,
             dense_ds=dense_ds,
         )
-        return distance_budget_m, merge_path
 
-    upper = min(distance_budget_m, centerline.s[-1])
     lower = min(max(dense_ds, abs(lateral_offset_m) * 0.25), upper * 0.5)
 
     def length_for(s_merge: float) -> float:
-        return build_merge_path(
+        return merge_path_length(
             centerline,
             s_merge,
             lateral_offset_m,
             heading_offset_rad=heading_offset_rad,
             dense_ds=dense_ds,
-        ).sigma[-1]
+        )
 
     while lower > dense_ds * 1.0e-3 and length_for(lower) >= distance_budget_m:
         lower *= 0.5
@@ -643,15 +897,21 @@ def plan_recovery_path(
     heading_offset_rad: float = 0.0,
     dense_ds: float = 0.05,
 ) -> tuple[float, DensePath, float]:
-    candidate_path = build_merge_path(
+    candidate_length = merge_path_length(
         centerline=centerline,
         s_merge=distance_budget_m,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
         dense_ds=dense_ds,
     )
-    candidate_length = candidate_path.sigma[-1]
     if candidate_length <= distance_budget_m + 1.0e-3:
+        candidate_path = build_merge_path(
+            centerline=centerline,
+            s_merge=distance_budget_m,
+            lateral_offset_m=lateral_offset_m,
+            heading_offset_rad=heading_offset_rad,
+            dense_ds=dense_ds,
+        )
         speed_scale = candidate_length / max(distance_budget_m, 1.0e-9)
         return distance_budget_m, candidate_path, speed_scale
 
@@ -674,16 +934,16 @@ def build_full_augmented_path(
 ) -> DensePath:
     continuation_end_s = total_distance_m
     continuation_s = np.arange(s_merge, continuation_end_s, dense_ds)
-    if len(continuation_s) == 0 or not np.isclose(continuation_s[-1], continuation_end_s):
+    if len(continuation_s) == 0 or abs(continuation_s[-1] - continuation_end_s) > 1.0e-12:
         continuation_s = np.append(continuation_s, continuation_end_s)
 
-    cont_x, cont_y, _ = sample_centerline(centerline, continuation_s)
+    cont_x, cont_y, cont_yaw = sample_centerline(centerline, continuation_s)
     continuation_sigma = merge_path.sigma[-1] + (continuation_s - s_merge)
 
     full_sigma = np.concatenate((merge_path.sigma, continuation_sigma[1:]))
     full_x = np.concatenate((merge_path.x, cont_x[1:]))
     full_y = np.concatenate((merge_path.y, cont_y[1:]))
-    full_yaw = heading_from_xy(full_x, full_y, full_sigma)
+    full_yaw = np.concatenate((merge_path.yaw, cont_yaw[1:]))
     return DensePath(sigma=full_sigma, x=full_x, y=full_y, yaw=full_yaw)
 
 
@@ -725,44 +985,56 @@ def augment_directed_segment(
     connect_time_s: float,
     dense_ds: float = 0.05,
 ) -> SegmentAugmentationResult:
+    prepared = prepare_directed_segment(segment, dense_ds=dense_ds)
+    return augment_directed_segment_prepared(
+        prepared=prepared,
+        lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
+        connect_time_s=connect_time_s,
+    )
+
+
+def augment_directed_segment_prepared(
+    prepared: PreparedDirectedSegment,
+    lateral_offset_m: float,
+    heading_offset_rad: float,
+    connect_time_s: float,
+) -> SegmentAugmentationResult:
+    segment = prepared.segment
     if not 0.0 < connect_time_s <= segment.t[-1]:
         raise ValueError("connect_time_s must be within the segment horizon.")
 
-    centerline = build_centerline(segment, dense_ds=dense_ds)
-    distance_profile = cumulative_distance(segment.x, segment.y)
-    progress_time_samples, progress_time_lookup = build_progress_time_lookup(distance_profile, segment.t)
-    connect_budget_m = float(np.interp(connect_time_s, segment.t, distance_profile))
-    total_distance_m = float(distance_profile[-1])
+    connect_budget_m = float(np.interp(connect_time_s, segment.t, prepared.distance_profile))
     s_merge, merge_path, connect_speed_scale = plan_recovery_path(
-        centerline=centerline,
+        centerline=prepared.centerline,
         distance_budget_m=connect_budget_m,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
-        dense_ds=dense_ds,
+        dense_ds=prepared.dense_ds,
     )
 
     dense_full_path = build_full_augmented_path(
-        centerline=centerline,
+        centerline=prepared.centerline,
         merge_path=merge_path,
         s_merge=s_merge,
-        total_distance_m=total_distance_m,
-        dense_ds=dense_ds,
+        total_distance_m=prepared.total_distance_m,
+        dense_ds=prepared.dense_ds,
     )
 
     connect_mask = segment.t <= connect_time_s + 1.0e-9
-    progress_profile = distance_profile.copy()
+    progress_profile = prepared.distance_profile.copy()
     if connect_budget_m > 1.0e-9:
-        progress_profile[connect_mask] = distance_profile[connect_mask] * connect_speed_scale
+        progress_profile[connect_mask] = prepared.distance_profile[connect_mask] * connect_speed_scale
     else:
         progress_profile[connect_mask] = 0.0
 
     post_indices = np.where(~connect_mask)[0]
     merge_path_length_m = float(merge_path.sigma[-1]) if len(merge_path.sigma) > 0 else 0.0
     if len(post_indices) > 0:
-        merge_time_on_gt = float(np.interp(s_merge, progress_time_samples, progress_time_lookup))
+        merge_time_on_gt = float(np.interp(s_merge, prepared.progress_time_samples, prepared.progress_time_lookup))
         shifted_gt_time = merge_time_on_gt + (segment.t[post_indices] - connect_time_s)
         shifted_gt_time = np.clip(shifted_gt_time, segment.t[0], segment.t[-1])
-        centerline_progress = np.interp(shifted_gt_time, segment.t, distance_profile)
+        centerline_progress = np.interp(shifted_gt_time, segment.t, prepared.distance_profile)
         progress_profile[post_indices] = merge_path_length_m + (centerline_progress - s_merge)
 
     progress_profile = np.clip(progress_profile, 0.0, dense_full_path.sigma[-1])
@@ -778,9 +1050,9 @@ def augment_directed_segment(
     return SegmentAugmentationResult(
         original_segment=segment,
         augmented_segment=augmented_segment,
-        centerline=centerline,
+        centerline=prepared.centerline,
         dense_augmented_path=dense_full_path,
-        distance_profile=distance_profile,
+        distance_profile=prepared.distance_profile,
         progress_profile=progress_profile,
         exact_speed_profile=exact_speed_profile,
         connect_time_s=connect_time_s,
@@ -836,74 +1108,106 @@ def augment_trajectory_bidirectional(
     output_future_horizon_s: float = OUTPUT_FUTURE_HORIZON_S,
     pattern_name: str = "generated",
 ) -> BidirectionalAugmentationResult:
-    future_segment = extract_future_segment(gt, current_index)
-    past_reverse_segment = extract_reversed_past_segment(gt, current_index)
+    context = build_bidirectional_context(
+        gt=gt,
+        current_index=current_index,
+        pattern_name=pattern_name,
+        dense_ds=dense_ds,
+        output_past_horizon_s=output_past_horizon_s,
+        output_future_horizon_s=output_future_horizon_s,
+    )
+    return augment_trajectory_bidirectional_prepared(
+        context=context,
+        lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
+        future_recover_time_s=future_recover_time_s,
+        past_connect_time_s=past_connect_time_s,
+    )
 
-    future_result = augment_directed_segment(
-        segment=future_segment,
+
+def augment_trajectory_bidirectional_prepared(
+    context: BidirectionalAugmentationContext,
+    lateral_offset_m: float,
+    heading_offset_rad: float,
+    future_recover_time_s: float,
+    past_connect_time_s: float,
+) -> BidirectionalAugmentationResult:
+    future_result = augment_directed_segment_prepared(
+        prepared=context.future_segment,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
         connect_time_s=future_recover_time_s,
-        dense_ds=dense_ds,
     )
-    past_result = augment_directed_segment(
-        segment=past_reverse_segment,
+    past_result = augment_directed_segment_prepared(
+        prepared=context.past_segment,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=-heading_offset_rad,
         connect_time_s=past_connect_time_s,
-        dense_ds=dense_ds,
+    )
+    return assemble_bidirectional_result(
+        context=context,
+        future_result=future_result,
+        past_result=past_result,
+        lateral_offset_m=lateral_offset_m,
+        heading_offset_rad=heading_offset_rad,
+        past_connect_time_s=past_connect_time_s,
+        future_recover_time_s=future_recover_time_s,
     )
 
-    original_past = gt.slice(0, current_index + 1)
-    original_future = gt.slice(current_index, None)
 
+def assemble_bidirectional_result(
+    context: BidirectionalAugmentationContext,
+    future_result: SegmentAugmentationResult,
+    past_result: SegmentAugmentationResult,
+    lateral_offset_m: float,
+    heading_offset_rad: float,
+    past_connect_time_s: float,
+    future_recover_time_s: float,
+) -> BidirectionalAugmentationResult:
     augmented_past_x = past_result.augmented_segment.x[::-1]
     augmented_past_y = past_result.augmented_segment.y[::-1]
 
-    augmented_full_x = gt.x.copy()
-    augmented_full_y = gt.y.copy()
-    augmented_full_x[:current_index] = augmented_past_x[:-1]
-    augmented_full_y[:current_index] = augmented_past_y[:-1]
-    augmented_full_x[current_index:] = future_result.augmented_segment.x
-    augmented_full_y[current_index:] = future_result.augmented_segment.y
+    augmented_full_x = context.original_full.x.copy()
+    augmented_full_y = context.original_full.y.copy()
+    augmented_full_x[: context.current_index] = augmented_past_x[:-1]
+    augmented_full_y[: context.current_index] = augmented_past_y[:-1]
+    augmented_full_x[context.current_index :] = future_result.augmented_segment.x
+    augmented_full_y[context.current_index :] = future_result.augmented_segment.y
 
-    augmented_full_yaw = compute_forward_yaw(augmented_full_x, augmented_full_y, fallback_yaw=gt.yaw)
+    augmented_full_yaw = compute_forward_yaw(
+        augmented_full_x,
+        augmented_full_y,
+        fallback_yaw=context.original_full.yaw,
+    )
     augmented_full = Trajectory2D(
-        t=gt.t.copy(),
+        t=context.original_full.t.copy(),
         x=augmented_full_x,
         y=augmented_full_y,
         yaw=augmented_full_yaw,
     )
 
-    augmented_past = augmented_full.slice(0, current_index + 1)
-    augmented_future = augmented_full.slice(current_index, None)
-
-    original_window, window_start_index, window_end_index = extract_time_window(
-        gt,
-        start_time_s=-output_past_horizon_s,
-        end_time_s=output_future_horizon_s,
-    )
-    augmented_window, _, _ = extract_time_window(
-        augmented_full,
-        start_time_s=-output_past_horizon_s,
-        end_time_s=output_future_horizon_s,
+    augmented_past = augmented_full.slice(0, context.current_index + 1)
+    augmented_future = augmented_full.slice(context.current_index, None)
+    augmented_window = augmented_full.slice(
+        context.window_start_index,
+        context.window_end_index + 1,
     )
 
     return BidirectionalAugmentationResult(
-        pattern_name=pattern_name,
-        original_full=gt.slice(0, None),
+        pattern_name=context.pattern_name,
+        original_full=context.original_full,
         augmented_full=augmented_full,
-        original_past=original_past,
-        original_future=original_future,
+        original_past=context.original_past,
+        original_future=context.original_future,
         augmented_past=augmented_past,
         augmented_future=augmented_future,
-        original_window=original_window,
+        original_window=context.original_window,
         augmented_window=augmented_window,
         past_segment=past_result,
         future_segment=future_result,
-        current_index=current_index,
-        window_start_index=window_start_index,
-        window_end_index=window_end_index,
+        current_index=context.current_index,
+        window_start_index=context.window_start_index,
+        window_end_index=context.window_end_index,
         lateral_offset_m=lateral_offset_m,
         heading_offset_rad=heading_offset_rad,
         past_connect_time_s=past_connect_time_s,
@@ -953,6 +1257,110 @@ def exact_arc_speed_in_window(result: BidirectionalAugmentationResult) -> tuple[
     aug_full_speed = np.concatenate((past_aug_speed[:-1], future_aug_speed))
     window_slice = slice(result.window_start_index, result.window_end_index + 1)
     return gt_full_speed[window_slice], aug_full_speed[window_slice]
+
+
+def window_series_from_segments(
+    context: BidirectionalAugmentationContext,
+    past_series: np.ndarray,
+    future_series: np.ndarray,
+) -> np.ndarray:
+    past_window = past_series[::-1][-context.past_window_size :]
+    future_window = future_series[: context.future_window_size]
+    return np.concatenate((past_window[:-1], future_window))
+
+
+def evaluate_constraints_from_segments(
+    context: BidirectionalAugmentationContext,
+    past_result: SegmentAugmentationResult,
+    future_result: SegmentAugmentationResult,
+    max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
+) -> ConstraintDiagnostics:
+    augmented_arc_speed = window_series_from_segments(
+        context,
+        past_result.exact_speed_profile,
+        future_result.exact_speed_profile,
+    )
+    augmented_window_x = window_series_from_segments(
+        context,
+        past_result.augmented_segment.x,
+        future_result.augmented_segment.x,
+    )
+    augmented_window_y = window_series_from_segments(
+        context,
+        past_result.augmented_segment.y,
+        future_result.augmented_segment.y,
+    )
+    augmented_window_sigma = cumulative_distance(augmented_window_x, augmented_window_y)
+    augmented_curvature = curvature_from_xy(
+        augmented_window_x,
+        augmented_window_y,
+        augmented_window_sigma,
+    )
+    augmented_lateral_accel = lateral_acceleration_from_speed_and_curvature(
+        augmented_arc_speed,
+        augmented_curvature,
+    )
+    max_abs_augmented_lateral_accel = float(np.max(np.abs(augmented_lateral_accel)))
+
+    past_aug_acceleration = acceleration_from_speed(
+        past_result.exact_speed_profile,
+        past_result.augmented_segment.t,
+    )
+    future_aug_acceleration = acceleration_from_speed(
+        future_result.exact_speed_profile,
+        future_result.augmented_segment.t,
+    )
+    past_aug_jerk = jerk_from_acceleration(past_aug_acceleration, past_result.augmented_segment.t)
+    future_aug_jerk = jerk_from_acceleration(future_aug_acceleration, future_result.augmented_segment.t)
+
+    bridge_speed_gap = window_series_from_segments(
+        context,
+        np.abs(past_result.exact_speed_profile - context.past_segment.gt_exact_speed_profile),
+        np.abs(future_result.exact_speed_profile - context.future_segment.gt_exact_speed_profile),
+    )
+    augmented_longitudinal_jerk = window_series_from_segments(
+        context,
+        past_aug_jerk,
+        future_aug_jerk,
+    )
+    bridge_mask = (
+        (context.original_window.t >= -past_result.connect_time_s - 1.0e-9)
+        & (context.original_window.t <= future_result.connect_time_s + 1.0e-9)
+    )
+    max_speed_gap = float(np.max(bridge_speed_gap[bridge_mask])) if np.any(bridge_mask) else 0.0
+    max_abs_bridge_jerk = (
+        float(np.max(np.abs(augmented_longitudinal_jerk[bridge_mask])))
+        if np.any(bridge_mask)
+        else 0.0
+    )
+
+    lateral_accel_passes = max_abs_augmented_lateral_accel <= float(max_lateral_accel_mps2) + 1.0e-9
+    speed_gap_passes = max_speed_gap <= float(max_bridge_speed_gap_mps) + 1.0e-9
+    jerk_passes = max_abs_bridge_jerk <= float(max_bridge_jerk_mps3) + 1.0e-9
+
+    return ConstraintDiagnostics(
+        time=context.original_window.t.copy(),
+        bridge_mask=bridge_mask,
+        lateral_accel_limit_mps2=float(max_lateral_accel_mps2),
+        speed_gap_limit_mps=float(max_bridge_speed_gap_mps),
+        jerk_limit_mps3=float(max_bridge_jerk_mps3),
+        gt_lateral_accel_mps2=context.gt_window_lateral_accel,
+        augmented_lateral_accel_mps2=augmented_lateral_accel,
+        max_abs_augmented_lateral_accel_mps2=max_abs_augmented_lateral_accel,
+        gt_arc_speed_mps=context.gt_window_arc_speed,
+        augmented_arc_speed_mps=augmented_arc_speed,
+        bridge_speed_gap_mps=bridge_speed_gap,
+        max_bridge_speed_gap_mps=max_speed_gap,
+        gt_longitudinal_jerk_mps3=context.gt_window_longitudinal_jerk,
+        augmented_longitudinal_jerk_mps3=augmented_longitudinal_jerk,
+        max_abs_bridge_jerk_mps3=max_abs_bridge_jerk,
+        lateral_accel_passes=lateral_accel_passes,
+        speed_gap_passes=speed_gap_passes,
+        jerk_passes=jerk_passes,
+        passes=lateral_accel_passes and speed_gap_passes and jerk_passes,
+    )
 
 
 def exact_arc_kinematics_in_window(
@@ -1019,60 +1427,14 @@ def evaluate_constraints_in_window(
     max_bridge_speed_gap_mps: float,
     max_bridge_jerk_mps3: float,
 ) -> ConstraintDiagnostics:
-    (
-        _time,
-        gt_arc_speed,
-        augmented_arc_speed,
-        _gt_acceleration,
-        _augmented_acceleration,
-        _window_gt_jerk,
-        _window_augmented_jerk,
-    ) = exact_arc_kinematics_in_window(result)
-    gt_curvature = curvature_from_xy(
-        result.original_window.x,
-        result.original_window.y,
-        cumulative_distance(result.original_window.x, result.original_window.y),
-    )
-    augmented_curvature = curvature_from_xy(
-        result.augmented_window.x,
-        result.augmented_window.y,
-        cumulative_distance(result.augmented_window.x, result.augmented_window.y),
-    )
-
-    gt_lateral_accel = lateral_acceleration_from_speed_and_curvature(gt_arc_speed, gt_curvature)
-    augmented_lateral_accel = lateral_acceleration_from_speed_and_curvature(
-        augmented_arc_speed,
-        augmented_curvature,
-    )
-    max_abs_augmented_lateral_accel = float(np.max(np.abs(augmented_lateral_accel)))
-    bridge_time, bridge_mask, bridge_speed_gap, gt_jerk, augmented_jerk = bridge_constraint_series(result)
-    max_speed_gap = float(np.max(bridge_speed_gap[bridge_mask])) if np.any(bridge_mask) else 0.0
-    max_abs_bridge_jerk = float(np.max(np.abs(augmented_jerk[bridge_mask]))) if np.any(bridge_mask) else 0.0
-
-    lateral_accel_passes = max_abs_augmented_lateral_accel <= float(max_lateral_accel_mps2) + 1.0e-9
-    speed_gap_passes = max_speed_gap <= float(max_bridge_speed_gap_mps) + 1.0e-9
-    jerk_passes = max_abs_bridge_jerk <= float(max_bridge_jerk_mps3) + 1.0e-9
-
-    return ConstraintDiagnostics(
-        time=bridge_time,
-        bridge_mask=bridge_mask,
-        lateral_accel_limit_mps2=float(max_lateral_accel_mps2),
-        speed_gap_limit_mps=float(max_bridge_speed_gap_mps),
-        jerk_limit_mps3=float(max_bridge_jerk_mps3),
-        gt_lateral_accel_mps2=gt_lateral_accel,
-        augmented_lateral_accel_mps2=augmented_lateral_accel,
-        max_abs_augmented_lateral_accel_mps2=max_abs_augmented_lateral_accel,
-        gt_arc_speed_mps=gt_arc_speed,
-        augmented_arc_speed_mps=augmented_arc_speed,
-        bridge_speed_gap_mps=bridge_speed_gap,
-        max_bridge_speed_gap_mps=max_speed_gap,
-        gt_longitudinal_jerk_mps3=gt_jerk,
-        augmented_longitudinal_jerk_mps3=augmented_jerk,
-        max_abs_bridge_jerk_mps3=max_abs_bridge_jerk,
-        lateral_accel_passes=lateral_accel_passes,
-        speed_gap_passes=speed_gap_passes,
-        jerk_passes=jerk_passes,
-        passes=lateral_accel_passes and speed_gap_passes and jerk_passes,
+    context = build_bidirectional_context_from_result(result)
+    return evaluate_constraints_from_segments(
+        context=context,
+        past_result=result.past_segment,
+        future_result=result.future_segment,
+        max_lateral_accel_mps2=max_lateral_accel_mps2,
+        max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+        max_bridge_jerk_mps3=max_bridge_jerk_mps3,
     )
 
 
@@ -1107,8 +1469,11 @@ def search_feasible_result(
     max_future_recover_time_s: float = FULL_FUTURE_HORIZON_S,
     max_past_connect_time_s: float = FULL_PAST_HORIZON_S,
 ) -> FeasibilitySearchDiagnostics:
-    initial = evaluate_constraints_in_window(
-        initial_result,
+    context = build_bidirectional_context_from_result(initial_result)
+    initial = evaluate_constraints_from_segments(
+        context=context,
+        past_result=initial_result.past_segment,
+        future_result=initial_result.future_segment,
         max_lateral_accel_mps2=max_lateral_accel_mps2,
         max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
         max_bridge_jerk_mps3=max_bridge_jerk_mps3,
@@ -1121,18 +1486,83 @@ def search_feasible_result(
             adaptation_strategy=None,
         )
 
-    def build_candidate(recover_time_s: float, past_connect_time_s: float) -> BidirectionalAugmentationResult:
-        return augment_trajectory_bidirectional(
-            gt=initial_result.original_full,
-            current_index=initial_result.current_index,
-            lateral_offset_m=initial_result.lateral_offset_m,
-            heading_offset_rad=initial_result.heading_offset_rad,
-            future_recover_time_s=recover_time_s,
-            past_connect_time_s=past_connect_time_s,
-            output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
-            output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
-            pattern_name=initial_result.pattern_name,
+    candidate_cache: dict[
+        tuple[float, float],
+        tuple[SegmentAugmentationResult, SegmentAugmentationResult, ConstraintDiagnostics],
+    ] = {}
+    future_segment_cache: dict[float, SegmentAugmentationResult] = {}
+    past_segment_cache: dict[float, SegmentAugmentationResult] = {}
+
+    def evaluate_candidate(
+        recover_time_s: float,
+        past_connect_time_s: float,
+    ) -> tuple[SegmentAugmentationResult, SegmentAugmentationResult, ConstraintDiagnostics]:
+        key = (round(past_connect_time_s, 6), round(recover_time_s, 6))
+        cached = candidate_cache.get(key)
+        if cached is not None:
+            return cached
+
+        future_key = round(recover_time_s, 6)
+        future_result = future_segment_cache.get(future_key)
+        if future_result is None:
+            future_result = augment_directed_segment_prepared(
+                prepared=context.future_segment,
+                lateral_offset_m=initial_result.lateral_offset_m,
+                heading_offset_rad=initial_result.heading_offset_rad,
+                connect_time_s=recover_time_s,
+            )
+            future_segment_cache[future_key] = future_result
+
+        past_key = round(past_connect_time_s, 6)
+        past_result = past_segment_cache.get(past_key)
+        if past_result is None:
+            past_result = augment_directed_segment_prepared(
+                prepared=context.past_segment,
+                lateral_offset_m=initial_result.lateral_offset_m,
+                heading_offset_rad=-initial_result.heading_offset_rad,
+                connect_time_s=past_connect_time_s,
+            )
+            past_segment_cache[past_key] = past_result
+
+        candidate_diag = evaluate_constraints_from_segments(
+            context=context,
+            future_result=future_result,
+            past_result=past_result,
+            max_lateral_accel_mps2=max_lateral_accel_mps2,
+            max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+            max_bridge_jerk_mps3=max_bridge_jerk_mps3,
         )
+        candidate_cache[key] = (future_result, past_result, candidate_diag)
+        return future_result, past_result, candidate_diag
+
+    feasible_n_cache: dict[float, tuple[BidirectionalAugmentationResult, ConstraintDiagnostics] | None] = {}
+
+    def find_first_feasible_n(
+        past_connect_time_s: float,
+        future_candidates_s: list[float],
+    ) -> tuple[BidirectionalAugmentationResult, ConstraintDiagnostics] | None:
+        cache_key = round(past_connect_time_s, 6)
+        if cache_key in feasible_n_cache:
+            return feasible_n_cache[cache_key]
+
+        for candidate_n in future_candidates_s:
+            future_result, past_result, candidate_diag = evaluate_candidate(candidate_n, past_connect_time_s)
+            if candidate_diag.passes:
+                candidate_result = assemble_bidirectional_result(
+                    context=context,
+                    future_result=future_result,
+                    past_result=past_result,
+                    lateral_offset_m=initial_result.lateral_offset_m,
+                    heading_offset_rad=initial_result.heading_offset_rad,
+                    past_connect_time_s=past_connect_time_s,
+                    future_recover_time_s=candidate_n,
+                )
+                candidate = (candidate_result, candidate_diag)
+                feasible_n_cache[cache_key] = candidate
+                return candidate
+
+        feasible_n_cache[cache_key] = None
+        return None
 
     initial_n = initial_result.future_recover_time_s
     initial_m = initial_result.past_connect_time_s
@@ -1142,21 +1572,14 @@ def search_feasible_result(
         end_s=max_future_recover_time_s,
         step_s=search_step_s,
     )
-    for candidate_n in future_candidates:
-        candidate_result = build_candidate(candidate_n, initial_m)
-        candidate_diag = evaluate_constraints_in_window(
-            candidate_result,
-            max_lateral_accel_mps2=max_lateral_accel_mps2,
-            max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
-            max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+    future_only_candidate = find_first_feasible_n(initial_m, future_candidates)
+    if future_only_candidate is not None:
+        return FeasibilitySearchDiagnostics(
+            initial=initial,
+            adapted_result=future_only_candidate[0],
+            adapted=future_only_candidate[1],
+            adaptation_strategy="extend N",
         )
-        if candidate_diag.passes:
-            return FeasibilitySearchDiagnostics(
-                initial=initial,
-                adapted_result=candidate_result,
-                adapted=candidate_diag,
-                adaptation_strategy="extend N",
-            )
 
     past_candidates = generate_time_candidates(
         start_s=initial_m + search_step_s,
@@ -1168,23 +1591,33 @@ def search_feasible_result(
         end_s=max_future_recover_time_s,
         step_s=search_step_s,
     )
-    for candidate_m in past_candidates:
-        for candidate_n in future_with_past_candidates:
-            candidate_result = build_candidate(candidate_n, candidate_m)
-            candidate_diag = evaluate_constraints_in_window(
-                candidate_result,
-                max_lateral_accel_mps2=max_lateral_accel_mps2,
-                max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
-                max_bridge_jerk_mps3=max_bridge_jerk_mps3,
-            )
-            if candidate_diag.passes:
-                strategy = "extend M" if np.isclose(candidate_n, initial_n) else "extend M and N"
-                return FeasibilitySearchDiagnostics(
-                    initial=initial,
-                    adapted_result=candidate_result,
-                    adapted=candidate_diag,
-                    adaptation_strategy=strategy,
-                )
+    if past_candidates:
+        if find_first_feasible_n(past_candidates[-1], future_with_past_candidates) is not None:
+            lo = 0
+            hi = len(past_candidates) - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if find_first_feasible_n(past_candidates[mid], future_with_past_candidates) is not None:
+                    hi = mid
+                else:
+                    lo = mid + 1
+
+            first_past_idx = lo
+            local_start = max(0, first_past_idx - 2)
+            for idx in range(local_start, first_past_idx + 1):
+                candidate = find_first_feasible_n(past_candidates[idx], future_with_past_candidates)
+                if candidate is not None:
+                    strategy = (
+                        "extend M"
+                        if abs(candidate[0].future_recover_time_s - initial_n) <= 1.0e-9
+                        else "extend M and N"
+                    )
+                    return FeasibilitySearchDiagnostics(
+                        initial=initial,
+                        adapted_result=candidate[0],
+                        adapted=candidate[1],
+                        adaptation_strategy=strategy,
+                    )
 
     return FeasibilitySearchDiagnostics(
         initial=initial,
