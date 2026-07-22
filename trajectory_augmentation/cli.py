@@ -14,6 +14,7 @@ from .core import (
     OUTPUT_FUTURE_HORIZON_S,
     OUTPUT_PAST_HORIZON_S,
     DemoArtifacts,
+    LateralBump,
     chord_speed_from_trajectory,
     cumulative_distance,
     curvature_from_xy,
@@ -22,6 +23,7 @@ from .core import (
     format_time_suffix,
     format_yaw_suffix,
     list_pattern_names,
+    run_bump_demo_case,
     run_demo_case,
     write_test_pattern_csvs,
 )
@@ -76,6 +78,18 @@ def summarize_demo_case(
     else:
         lines.append(f"Past bridge M: {result.past_connect_time_s:.2f} s")
         lines.append(f"Future bridge N: {result.future_recover_time_s:.2f} s")
+
+    if result.past_lateral_bump is not None:
+        bump = result.past_lateral_bump
+        lines.append(
+            f"Past history bump: t in [-{bump.start_time_s + bump.duration_s:.2f}, "
+            f"-{bump.start_time_s:.2f}] s, amplitude {bump.amplitude_m:+.2f} m"
+        )
+    elif artifacts.requested_past_bump:
+        lines.append(
+            "Past history bump: requested but not applied "
+            "(all sampled bumps violated the constraints)"
+        )
 
     lines.extend(
         [
@@ -145,41 +159,113 @@ def run_sweep(
     max_bridge_speed_gap_mps: float,
     max_bridge_jerk_mps3: float,
     adaptive_bridge_search: bool,
+    bump_options: list[bool] | None = None,
+    randomize_bridge_times: bool = False,
+    bridge_time_extra_range_s: float = 1.5,
 ) -> tuple[list[Path], list[Path]]:
     output_paths: list[Path] = []
     pattern_suffix = f"_{pattern_name}"
+    if bump_options is None:
+        bump_options = [False]
 
     for past_connect_time_s in past_connect_times:
         for offset in offsets:
             for yaw_offset_deg in yaw_offsets_deg:
                 for recover_time_s in recover_times:
-                    artifacts = run_demo_case(
-                        pattern_name=pattern_name,
-                        pattern_dir=pattern_dir,
-                        seed=seed,
-                        offset_m=offset,
-                        yaw_offset_deg=yaw_offset_deg,
-                        recover_time_s=recover_time_s,
-                        past_connect_time_s=past_connect_time_s,
-                        max_lateral_accel_mps2=max_lateral_accel_mps2,
-                        max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
-                        max_bridge_jerk_mps3=max_bridge_jerk_mps3,
-                        adaptive_bridge_search=adaptive_bridge_search,
-                    )
-                    suffix = (
-                        pattern_suffix
-                        + format_offset_suffix(offset)
-                        + format_yaw_suffix(yaw_offset_deg)
-                        + format_time_suffix("N", recover_time_s)
-                        + format_time_suffix("M", past_connect_time_s)
-                    )
-                    output_path = output_prefix.with_name(f"{output_prefix.name}{suffix}.html")
-                    _render_case_outputs(
-                        artifacts,
-                        output_path=output_path,
-                    )
-                    output_paths.append(output_path)
+                    for past_bump in bump_options:
+                        artifacts = run_demo_case(
+                            pattern_name=pattern_name,
+                            pattern_dir=pattern_dir,
+                            seed=seed,
+                            offset_m=offset,
+                            yaw_offset_deg=yaw_offset_deg,
+                            recover_time_s=recover_time_s,
+                            past_connect_time_s=past_connect_time_s,
+                            max_lateral_accel_mps2=max_lateral_accel_mps2,
+                            max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+                            max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+                            adaptive_bridge_search=adaptive_bridge_search,
+                            randomize_bridge_times=randomize_bridge_times,
+                            bridge_time_extra_range_s=bridge_time_extra_range_s,
+                            past_bump=past_bump,
+                        )
+                        suffix = (
+                            pattern_suffix
+                            + format_offset_suffix(offset)
+                            + format_yaw_suffix(yaw_offset_deg)
+                            + format_time_suffix("N", recover_time_s)
+                            + format_time_suffix("M", past_connect_time_s)
+                            + f"_bump{int(past_bump)}"
+                        )
+                        output_path = output_prefix.with_name(f"{output_prefix.name}{suffix}.html")
+                        _render_case_outputs(
+                            artifacts,
+                            output_path=output_path,
+                        )
+                        output_paths.append(output_path)
     return output_paths, []
+
+
+def format_bump_amplitude_suffix(value_m: float) -> str:
+    sign = "p" if value_m >= 0.0 else "m"
+    magnitude = f"{abs(value_m):.2f}".replace(".", "p")
+    return f"_bumpA{sign}{magnitude}m"
+
+
+def run_bump_sweep(
+    pattern_name: str,
+    pattern_dir: Path,
+    output_prefix: Path,
+    offset_m: float,
+    yaw_offset_deg: float,
+    recover_time_s: float,
+    past_connect_time_s: float,
+    amplitudes_m: list[float],
+    durations_s: list[float],
+    start_times_s: list[float],
+    max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
+    adaptive_bridge_search: bool,
+) -> tuple[list[Path], int]:
+    output_paths: list[Path] = []
+    skipped = 0
+    base_suffix = f"_{pattern_name}" + format_offset_suffix(offset_m) + format_yaw_suffix(yaw_offset_deg)
+
+    for amplitude_m in amplitudes_m:
+        for duration_s in durations_s:
+            for start_time_s in start_times_s:
+                if start_time_s + duration_s > OUTPUT_PAST_HORIZON_S + 1.0e-9:
+                    skipped += 1
+                    continue
+                bump = LateralBump(
+                    start_time_s=start_time_s,
+                    duration_s=duration_s,
+                    amplitude_m=amplitude_m,
+                )
+                artifacts = run_bump_demo_case(
+                    pattern_name=pattern_name,
+                    pattern_dir=pattern_dir,
+                    offset_m=offset_m,
+                    yaw_offset_deg=yaw_offset_deg,
+                    recover_time_s=recover_time_s,
+                    past_connect_time_s=past_connect_time_s,
+                    bump=bump,
+                    max_lateral_accel_mps2=max_lateral_accel_mps2,
+                    max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+                    max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+                    adaptive_bridge_search=adaptive_bridge_search,
+                )
+                suffix = (
+                    base_suffix
+                    + format_bump_amplitude_suffix(amplitude_m)
+                    + format_time_suffix("bumpD", duration_s)
+                    + format_time_suffix("bumpS", start_time_s)
+                )
+                output_path = output_prefix.with_name(f"{output_prefix.name}{suffix}.html")
+                _render_case_outputs(artifacts, output_path=output_path)
+                output_paths.append(output_path)
+    return output_paths, skipped
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -226,9 +312,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum allowed absolute longitudinal jerk [m/s^3] during adaptive bridge search.",
     )
     parser.add_argument(
-        "--disable-adaptive-bridge-search",
+        "--adaptive-bridge-search",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable the automatic bridge-time search (--adaptive-bridge-search) or "
+            "disable it to only diagnose constraint violations "
+            "(--no-adaptive-bridge-search). Required unless --list-patterns or "
+            "--write-pattern-csvs is used."
+        ),
+    )
+    parser.add_argument(
+        "--randomize-bridge-times",
         action="store_true",
-        help="Only diagnose lateral-acceleration limit violations without searching for a feasible M/N pair.",
+        help=(
+            "After finding the minimal feasible M/N, sample random feasible bridge "
+            "times above those minimums to decorrelate history and recovery."
+        ),
+    )
+    parser.add_argument(
+        "--bridge-time-extra-range",
+        type=float,
+        default=1.5,
+        help="Upper range [s] added on top of the minimal feasible M/N when randomizing bridge times.",
+    )
+    parser.add_argument(
+        "--past-bump",
+        action="store_true",
+        help="Inject one random lateral bump into the past history.",
     )
     parser.add_argument("--write-pattern-csvs", action="store_true", help="Generate the CSV test patterns and exit.")
     parser.add_argument("--list-patterns", action="store_true", help="List available pattern names and exit.")
@@ -239,6 +350,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to save the interactive Plotly HTML figure.",
     )
     parser.add_argument("--sweep", action="store_true", help="Render the requested offset/recovery sweep.")
+    parser.add_argument(
+        "--bump-sweep",
+        action="store_true",
+        help=(
+            "Render a sweep over deterministic past-history bump parameters "
+            "(amplitude x duration x start time) with fixed offset and bridge times. "
+            "Each figure compares the no-bump baseline (seed) with the bumped variant (best)."
+        ),
+    )
     parser.add_argument(
         "--output-prefix",
         type=Path,
@@ -262,13 +382,47 @@ def main() -> None:
         print(f"Wrote {len(output_paths)} pattern CSV files to: {args.pattern_dir}")
         return
 
-    adaptive_bridge_search = not args.disable_adaptive_bridge_search
+    if args.adaptive_bridge_search is None:
+        parser.error("--adaptive-bridge-search or --no-adaptive-bridge-search is required")
+    adaptive_bridge_search = args.adaptive_bridge_search
+
+    if args.bump_sweep:
+        amplitudes_m = [-1.2, -0.1, 0.1, 1.2]
+        durations_s = [0.8, 1.2, 1.6, 2.0]
+        start_times_s = [0.3, 0.8, 1.3, 1.8]
+        output_paths, skipped = run_bump_sweep(
+            pattern_name=args.pattern,
+            pattern_dir=args.pattern_dir,
+            output_prefix=args.output_prefix,
+            offset_m=args.offset if args.offset is not None else 1.0,
+            yaw_offset_deg=args.yaw_offset_deg,
+            recover_time_s=args.recover_time if args.recover_time is not None else 1.5,
+            past_connect_time_s=args.past_connect_time if args.past_connect_time is not None else 1.0,
+            amplitudes_m=amplitudes_m,
+            durations_s=durations_s,
+            start_times_s=start_times_s,
+            max_lateral_accel_mps2=args.max_lateral_accel,
+            max_bridge_speed_gap_mps=args.max_bridge_speed_gap,
+            max_bridge_jerk_mps3=args.max_bridge_jerk,
+            adaptive_bridge_search=adaptive_bridge_search,
+        )
+        print(f"Saved {len(output_paths)} bump sweep figures for pattern: {args.pattern}")
+        if skipped:
+            print(
+                f"Skipped {skipped} combinations whose bump would extend beyond "
+                f"the {OUTPUT_PAST_HORIZON_S:.0f}s past window"
+            )
+        if output_paths:
+            print(f"First figure: {output_paths[0]}")
+            print(f"Last figure: {output_paths[-1]}")
+        return
 
     if args.sweep:
         offsets = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
         yaw_offsets_deg = [-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0]
         recover_times = [0.5, 1.0, 1.5, 2.0]
         past_connect_times = [0.5, 1.0, 1.5, 2.0]
+        bump_options = [False, True]
         output_paths, _ = run_sweep(
             pattern_name=args.pattern,
             pattern_dir=args.pattern_dir,
@@ -278,10 +432,13 @@ def main() -> None:
             yaw_offsets_deg=yaw_offsets_deg,
             recover_times=recover_times,
             past_connect_times=past_connect_times,
+            bump_options=bump_options,
             max_lateral_accel_mps2=args.max_lateral_accel,
             max_bridge_speed_gap_mps=args.max_bridge_speed_gap,
             max_bridge_jerk_mps3=args.max_bridge_jerk,
             adaptive_bridge_search=adaptive_bridge_search,
+            randomize_bridge_times=args.randomize_bridge_times,
+            bridge_time_extra_range_s=args.bridge_time_extra_range,
         )
         print(f"Saved {len(output_paths)} interactive sweep figures for pattern: {args.pattern}")
         if output_paths:
@@ -301,6 +458,9 @@ def main() -> None:
         adaptive_bridge_search=adaptive_bridge_search,
         max_bridge_speed_gap_mps=args.max_bridge_speed_gap,
         max_bridge_jerk_mps3=args.max_bridge_jerk,
+        randomize_bridge_times=args.randomize_bridge_times,
+        bridge_time_extra_range_s=args.bridge_time_extra_range,
+        past_bump=args.past_bump,
     )
     _render_case_outputs(artifacts, output_path=args.output)
     for line in summarize_demo_case(

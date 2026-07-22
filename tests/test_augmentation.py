@@ -10,6 +10,7 @@ from trajectory_augmentation import (
     FULL_PAST_HORIZON_S,
     OUTPUT_FUTURE_HORIZON_S,
     OUTPUT_PAST_HORIZON_S,
+    LateralBump,
     augment_future_trajectory,
     augment_trajectory_bidirectional,
     build_progress_speed_lookup,
@@ -19,6 +20,7 @@ from trajectory_augmentation import (
     exact_arc_speed_in_window,
     list_pattern_names,
     load_test_pattern,
+    run_bump_demo_case,
     run_demo_case,
     sample_centerline,
     sample_speed_by_progress,
@@ -311,6 +313,118 @@ class DiffusionPlannerAugmentationTest(unittest.TestCase):
             self.assertIn("trajectory", html.lower())
             self.assertIn("Seed Trajectory", html)
             self.assertIn("Best Trajectory", html)
+
+    def test_past_bump_perturbs_history_but_preserves_future_and_t0(self) -> None:
+        gt, current_index = load_test_pattern("straight_constant", DEFAULT_PATTERN_DIR)
+        common_kwargs = dict(
+            gt=gt,
+            current_index=current_index,
+            lateral_offset_m=1.0,
+            heading_offset_rad=0.0,
+            future_recover_time_s=1.5,
+            past_connect_time_s=1.0,
+            pattern_name="straight_constant",
+        )
+        base = augment_trajectory_bidirectional(**common_kwargs)
+        bump = LateralBump(start_time_s=1.6, duration_s=1.2, amplitude_m=0.2)
+        bumped = augment_trajectory_bidirectional(**common_kwargs, past_lateral_bump=bump)
+
+        np.testing.assert_allclose(bumped.augmented_future.x, base.augmented_future.x, atol=1.0e-9)
+        np.testing.assert_allclose(bumped.augmented_future.y, base.augmented_future.y, atol=1.0e-9)
+
+        offset_vector = np.array(
+            [
+                bumped.augmented_full.x[current_index] - bumped.original_full.x[current_index],
+                bumped.augmented_full.y[current_index] - bumped.original_full.y[current_index],
+            ]
+        )
+        self.assertAlmostEqual(float(np.linalg.norm(offset_vector)), 1.0, places=3)
+
+        past_time = bumped.augmented_past.t
+        deviation = np.hypot(
+            bumped.augmented_past.x - base.augmented_past.x,
+            bumped.augmented_past.y - base.augmented_past.y,
+        )
+        bump_mask = (past_time >= -2.8 - 1.0e-9) & (past_time <= -1.6 + 1.0e-9)
+        recent_mask = past_time > -1.5
+        self.assertGreater(float(np.max(deviation[bump_mask])), 0.1)
+        self.assertLess(float(np.max(deviation[recent_mask])), 1.0e-6)
+
+    def test_run_demo_case_with_past_bump_passes_constraints(self) -> None:
+        artifacts = run_demo_case(
+            pattern_name="straight_constant",
+            pattern_dir=DEFAULT_PATTERN_DIR,
+            seed=7,
+            offset_m=1.0,
+            yaw_offset_deg=0.0,
+            recover_time_s=1.5,
+            past_connect_time_s=1.0,
+            max_lateral_accel_mps2=3.0,
+            adaptive_bridge_search=True,
+            past_bump=True,
+        )
+        result = artifacts.selected_result
+        self.assertIsNotNone(result.past_lateral_bump)
+        self.assertIn("past bump", artifacts.feasibility.adaptation_strategy)
+        self.assertIsNotNone(artifacts.feasibility.adapted)
+        self.assertTrue(artifacts.feasibility.adapted.passes)
+
+    def test_randomize_bridge_times_stays_feasible_and_varies_across_seeds(self) -> None:
+        selected_times = set()
+        for seed in (1, 2, 3, 4, 5):
+            artifacts = run_demo_case(
+                pattern_name="straight_constant",
+                pattern_dir=DEFAULT_PATTERN_DIR,
+                seed=seed,
+                offset_m=1.0,
+                yaw_offset_deg=0.0,
+                recover_time_s=None,
+                past_connect_time_s=None,
+                max_lateral_accel_mps2=3.0,
+                adaptive_bridge_search=True,
+                randomize_bridge_times=True,
+            )
+            result = artifacts.selected_result
+            self.assertIsNotNone(artifacts.feasibility.adapted)
+            self.assertTrue(artifacts.feasibility.adapted.passes)
+            selected_times.add(
+                (
+                    round(result.past_connect_time_s, 1),
+                    round(result.future_recover_time_s, 1),
+                )
+            )
+        self.assertGreater(len(selected_times), 1)
+
+    def test_bump_demo_case_pairs_baseline_and_bumped_variant(self) -> None:
+        bump = LateralBump(start_time_s=1.3, duration_s=1.6, amplitude_m=0.10)
+        artifacts = run_bump_demo_case(
+            pattern_name="straight_constant",
+            pattern_dir=DEFAULT_PATTERN_DIR,
+            offset_m=1.0,
+            yaw_offset_deg=0.0,
+            recover_time_s=1.5,
+            past_connect_time_s=1.0,
+            bump=bump,
+            max_lateral_accel_mps2=3.0,
+            adaptive_bridge_search=True,
+        )
+
+        self.assertTrue(artifacts.feasibility.initial.passes)
+        self.assertIsNone(artifacts.seed_result.past_lateral_bump)
+        self.assertIsNotNone(artifacts.selected_result.past_lateral_bump)
+        self.assertAlmostEqual(
+            artifacts.selected_result.past_connect_time_s,
+            artifacts.seed_result.past_connect_time_s,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            artifacts.selected_result.future_recover_time_s,
+            artifacts.seed_result.future_recover_time_s,
+            places=6,
+        )
+        self.assertIsNotNone(artifacts.feasibility.adapted)
+        self.assertTrue(artifacts.feasibility.adapted.passes)
+        self.assertIn("bump", artifacts.feasibility.adaptation_strategy)
 
     def test_stop8s_fixed_bridge_keeps_terminal_speed_above_gt(self) -> None:
         gt, current_index = load_test_pattern("straight_stop8s", DEFAULT_PATTERN_DIR)
