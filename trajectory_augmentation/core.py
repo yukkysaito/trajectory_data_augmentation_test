@@ -14,6 +14,11 @@ OUTPUT_FUTURE_HORIZON_S = 8.0
 DEFAULT_DT = 0.1
 MIN_BRIDGE_TIME_S = 0.1
 
+# Fixed sampling ranges for the single random past-history bump.
+BUMP_AMPLITUDE_RANGE_M = (0.05, 0.20)
+BUMP_DURATION_RANGE_S = (1.0, 2.0)
+BUMP_MIN_START_TIME_S = 0.3
+
 SHAPE_NAMES = ("straight", "curve", "s_curve")
 SPEED_PROFILE_NAMES = ("constant", "decelerating", "accelerating", "stopping", "stop8s")
 
@@ -54,6 +59,19 @@ class DensePath:
 
 
 @dataclass
+class LateralBump:
+    """Lateral perturbation applied to the past history.
+
+    Times are expressed in the reversed-past segment time axis: ``start_time_s``
+    seconds before t0, extending further into the past by ``duration_s``.
+    """
+
+    start_time_s: float
+    duration_s: float
+    amplitude_m: float
+
+
+@dataclass
 class SegmentAugmentationResult:
     original_segment: Trajectory2D
     augmented_segment: Trajectory2D
@@ -91,6 +109,7 @@ class BidirectionalAugmentationResult:
     heading_offset_rad: float
     past_connect_time_s: float
     future_recover_time_s: float
+    past_lateral_bump: LateralBump | None = None
 
 
 @dataclass
@@ -139,6 +158,7 @@ class DemoArtifacts:
     initial_recover_time_s: float
     initial_past_connect_time_s: float
     adaptive_bridge_search: bool
+    requested_past_bump: bool = False
 
 
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
@@ -698,6 +718,60 @@ def sample_dense_path(path: DensePath, sigma_query: np.ndarray) -> tuple[np.ndar
     return x, y, yaw
 
 
+def lateral_bump_window(unit_value: np.ndarray) -> np.ndarray:
+    # sin^3 is zero-valued with zero first and second derivatives at both
+    # edges, so the bump joins the surrounding path with C2 continuity.
+    u = np.clip(unit_value, 0.0, 1.0)
+    return np.sin(np.pi * u) ** 3
+
+
+def apply_lateral_bump_to_dense_path(
+    path: DensePath,
+    progress_profile: np.ndarray,
+    segment_time: np.ndarray,
+    bump: LateralBump,
+    min_bump_length_m: float = 0.5,
+) -> tuple[DensePath, np.ndarray]:
+    old_sigma = strictly_increasing_param(path.sigma)
+    bump_start_s = float(np.interp(bump.start_time_s, segment_time, progress_profile))
+    bump_end_s = float(np.interp(bump.start_time_s + bump.duration_s, segment_time, progress_profile))
+    if bump_end_s - bump_start_s < min_bump_length_m:
+        return path, progress_profile
+    u = (old_sigma - bump_start_s) / (bump_end_s - bump_start_s)
+    offset = bump.amplitude_m * lateral_bump_window(u)
+
+    normal_x = -np.sin(path.yaw)
+    normal_y = np.cos(path.yaw)
+    new_x = path.x + offset * normal_x
+    new_y = path.y + offset * normal_y
+    new_sigma = cumulative_distance(new_x, new_y)
+    new_yaw = heading_from_xy(new_x, new_y, new_sigma)
+    # Progress values refer to the unperturbed arc length; remap them so the
+    # vehicle stays aligned with GT along track and the extra bump length shows
+    # up as a locally higher exact-arc speed.
+    new_progress = np.interp(progress_profile, old_sigma, new_sigma)
+    return DensePath(sigma=new_sigma, x=new_x, y=new_y, yaw=new_yaw), new_progress
+
+
+def sample_past_history_bump(
+    rng: np.random.Generator,
+    past_horizon_s: float = OUTPUT_PAST_HORIZON_S,
+) -> LateralBump | None:
+    # The bump may overlap the past bridge window; every sampled candidate is
+    # re-checked against the bridge constraints, so only t0 needs protecting.
+    available_s = past_horizon_s - BUMP_MIN_START_TIME_S
+    if available_s < BUMP_DURATION_RANGE_S[0]:
+        return None
+    duration_s = float(rng.uniform(BUMP_DURATION_RANGE_S[0], min(BUMP_DURATION_RANGE_S[1], available_s)))
+    start_time_s = float(rng.uniform(BUMP_MIN_START_TIME_S, past_horizon_s - duration_s))
+    amplitude_m = float(rng.uniform(*BUMP_AMPLITUDE_RANGE_M) * rng.choice(np.array([-1.0, 1.0])))
+    return LateralBump(
+        start_time_s=start_time_s,
+        duration_s=duration_s,
+        amplitude_m=amplitude_m,
+    )
+
+
 def extract_future_segment(gt: Trajectory2D, current_index: int) -> Trajectory2D:
     future = gt.slice(current_index, None)
     return Trajectory2D(
@@ -724,6 +798,7 @@ def augment_directed_segment(
     heading_offset_rad: float,
     connect_time_s: float,
     dense_ds: float = 0.05,
+    lateral_bump: LateralBump | None = None,
 ) -> SegmentAugmentationResult:
     if not 0.0 < connect_time_s <= segment.t[-1]:
         raise ValueError("connect_time_s must be within the segment horizon.")
@@ -766,6 +841,14 @@ def augment_directed_segment(
         progress_profile[post_indices] = merge_path_length_m + (centerline_progress - s_merge)
 
     progress_profile = np.clip(progress_profile, 0.0, dense_full_path.sigma[-1])
+    if lateral_bump is not None:
+        dense_full_path, progress_profile = apply_lateral_bump_to_dense_path(
+            dense_full_path,
+            progress_profile,
+            segment.t,
+            lateral_bump,
+        )
+        progress_profile = np.clip(progress_profile, 0.0, dense_full_path.sigma[-1])
     query_x, query_y, directional_yaw = sample_dense_path(dense_full_path, progress_profile)
     exact_speed_profile = speed_from_progress(progress_profile, segment.t)
     augmented_segment = Trajectory2D(
@@ -835,6 +918,7 @@ def augment_trajectory_bidirectional(
     output_past_horizon_s: float = OUTPUT_PAST_HORIZON_S,
     output_future_horizon_s: float = OUTPUT_FUTURE_HORIZON_S,
     pattern_name: str = "generated",
+    past_lateral_bump: LateralBump | None = None,
 ) -> BidirectionalAugmentationResult:
     future_segment = extract_future_segment(gt, current_index)
     past_reverse_segment = extract_reversed_past_segment(gt, current_index)
@@ -852,6 +936,7 @@ def augment_trajectory_bidirectional(
         heading_offset_rad=-heading_offset_rad,
         connect_time_s=past_connect_time_s,
         dense_ds=dense_ds,
+        lateral_bump=past_lateral_bump,
     )
 
     original_past = gt.slice(0, current_index + 1)
@@ -908,6 +993,7 @@ def augment_trajectory_bidirectional(
         heading_offset_rad=heading_offset_rad,
         past_connect_time_s=past_connect_time_s,
         future_recover_time_s=future_recover_time_s,
+        past_lateral_bump=past_lateral_bump,
     )
 
 
@@ -1132,6 +1218,7 @@ def search_feasible_result(
             output_past_horizon_s=OUTPUT_PAST_HORIZON_S,
             output_future_horizon_s=OUTPUT_FUTURE_HORIZON_S,
             pattern_name=initial_result.pattern_name,
+            past_lateral_bump=initial_result.past_lateral_bump,
         )
 
     initial_n = initial_result.future_recover_time_s
@@ -1212,6 +1299,172 @@ def search_lateral_accel_feasible_result(
     )
 
 
+def snap_time_to_grid(value_s: float, step_s: float = DEFAULT_DT) -> float:
+    return round(value_s / step_s) * step_s
+
+
+def randomize_bridge_times_result(
+    rng: np.random.Generator,
+    base_result: BidirectionalAugmentationResult,
+    max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
+    extra_time_range_s: float = 1.5,
+    max_attempts: int = 10,
+    step_s: float = DEFAULT_DT,
+    max_future_recover_time_s: float = FULL_FUTURE_HORIZON_S,
+    max_past_connect_time_s: float = FULL_PAST_HORIZON_S,
+) -> tuple[BidirectionalAugmentationResult, ConstraintDiagnostics] | None:
+    """Sample random feasible bridge times at or above the given minimums.
+
+    ``base_result`` should already satisfy the constraints (e.g. the minimal
+    feasible M/N found by ``search_feasible_result``). Longer bridges are
+    usually gentler but not guaranteed feasible on curved sections, so each
+    candidate is re-checked and rejected candidates are re-sampled.
+    """
+    min_n = base_result.future_recover_time_s
+    min_m = base_result.past_connect_time_s
+    for _ in range(max_attempts):
+        candidate_n = snap_time_to_grid(min_n + float(rng.uniform(0.0, extra_time_range_s)), step_s)
+        candidate_m = snap_time_to_grid(min_m + float(rng.uniform(0.0, extra_time_range_s)), step_s)
+        candidate_n = float(np.clip(candidate_n, min_n, max_future_recover_time_s))
+        candidate_m = float(np.clip(candidate_m, min_m, max_past_connect_time_s))
+        candidate_result = augment_trajectory_bidirectional(
+            gt=base_result.original_full,
+            current_index=base_result.current_index,
+            lateral_offset_m=base_result.lateral_offset_m,
+            heading_offset_rad=base_result.heading_offset_rad,
+            future_recover_time_s=candidate_n,
+            past_connect_time_s=candidate_m,
+            pattern_name=base_result.pattern_name,
+            past_lateral_bump=base_result.past_lateral_bump,
+        )
+        candidate_diag = evaluate_constraints_in_window(
+            candidate_result,
+            max_lateral_accel_mps2=max_lateral_accel_mps2,
+            max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+            max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+        )
+        if candidate_diag.passes:
+            return candidate_result, candidate_diag
+    return None
+
+
+def apply_random_past_history_bump(
+    rng: np.random.Generator,
+    base_result: BidirectionalAugmentationResult,
+    max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float,
+    max_bridge_jerk_mps3: float,
+    max_attempts: int = 20,
+) -> tuple[BidirectionalAugmentationResult, ConstraintDiagnostics] | None:
+    for _ in range(max_attempts):
+        bump = sample_past_history_bump(rng)
+        if bump is None:
+            return None
+        candidate_result = augment_trajectory_bidirectional(
+            gt=base_result.original_full,
+            current_index=base_result.current_index,
+            lateral_offset_m=base_result.lateral_offset_m,
+            heading_offset_rad=base_result.heading_offset_rad,
+            future_recover_time_s=base_result.future_recover_time_s,
+            past_connect_time_s=base_result.past_connect_time_s,
+            pattern_name=base_result.pattern_name,
+            past_lateral_bump=bump,
+        )
+        candidate_diag = evaluate_constraints_in_window(
+            candidate_result,
+            max_lateral_accel_mps2=max_lateral_accel_mps2,
+            max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+            max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+        )
+        if candidate_diag.passes:
+            return candidate_result, candidate_diag
+    return None
+
+
+def run_bump_demo_case(
+    pattern_name: str,
+    pattern_dir: Path,
+    offset_m: float,
+    yaw_offset_deg: float,
+    recover_time_s: float,
+    past_connect_time_s: float,
+    bump: LateralBump,
+    max_lateral_accel_mps2: float,
+    max_bridge_speed_gap_mps: float = 0.5,
+    max_bridge_jerk_mps3: float = 5.0,
+    adaptive_bridge_search: bool = False,
+) -> DemoArtifacts:
+    """Pair a no-bump baseline with a deterministically bumped variant.
+
+    The returned artifacts show the baseline as the seed trajectory and the
+    bumped variant as the best trajectory, so plots compare the two directly.
+    With ``adaptive_bridge_search`` the baseline M/N are first adapted to be
+    feasible, and the bump is applied on top of the adapted bridge times.
+    """
+    gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
+    base_result = augment_trajectory_bidirectional(
+        gt=gt,
+        current_index=current_index,
+        lateral_offset_m=offset_m,
+        heading_offset_rad=np.deg2rad(yaw_offset_deg),
+        future_recover_time_s=recover_time_s,
+        past_connect_time_s=past_connect_time_s,
+        pattern_name=pattern_name,
+    )
+    if adaptive_bridge_search:
+        search = search_feasible_result(
+            initial_result=base_result,
+            max_lateral_accel_mps2=max_lateral_accel_mps2,
+            max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+            max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+        )
+        if search.adapted_result is not None:
+            base_result = search.adapted_result
+
+    bumped_result = augment_trajectory_bidirectional(
+        gt=gt,
+        current_index=current_index,
+        lateral_offset_m=offset_m,
+        heading_offset_rad=np.deg2rad(yaw_offset_deg),
+        future_recover_time_s=base_result.future_recover_time_s,
+        past_connect_time_s=base_result.past_connect_time_s,
+        pattern_name=pattern_name,
+        past_lateral_bump=bump,
+    )
+    base_diag = evaluate_constraints_in_window(
+        base_result,
+        max_lateral_accel_mps2=max_lateral_accel_mps2,
+        max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+        max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+    )
+    bump_diag = evaluate_constraints_in_window(
+        bumped_result,
+        max_lateral_accel_mps2=max_lateral_accel_mps2,
+        max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+        max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+    )
+    feasibility = FeasibilitySearchDiagnostics(
+        initial=base_diag,
+        adapted_result=bumped_result,
+        adapted=bump_diag,
+        adaptation_strategy=(
+            f"bump start {bump.start_time_s:.1f}s, "
+            f"dur {bump.duration_s:.1f}s, amp {bump.amplitude_m:+.2f}m"
+        ),
+    )
+    return DemoArtifacts(
+        seed_result=base_result,
+        selected_result=bumped_result,
+        feasibility=feasibility,
+        initial_recover_time_s=recover_time_s,
+        initial_past_connect_time_s=past_connect_time_s,
+        adaptive_bridge_search=adaptive_bridge_search,
+        requested_past_bump=True,
+    )
+
+
 def run_demo_case(
     pattern_name: str,
     pattern_dir: Path,
@@ -1224,6 +1477,9 @@ def run_demo_case(
     adaptive_bridge_search: bool = True,
     max_bridge_speed_gap_mps: float = 0.5,
     max_bridge_jerk_mps3: float = 5.0,
+    randomize_bridge_times: bool = False,
+    bridge_time_extra_range_s: float = 1.5,
+    past_bump: bool = False,
 ) -> DemoArtifacts:
     gt, current_index = load_test_pattern(pattern_name=pattern_name, pattern_dir=pattern_dir)
     rng = np.random.default_rng(seed)
@@ -1252,8 +1508,10 @@ def run_demo_case(
         max_bridge_jerk_mps3=max_bridge_jerk_mps3,
     )
     result = initial_result
+    selected_diag = feasibility.initial
     if adaptive_bridge_search and feasibility.adapted_result is not None:
         result = feasibility.adapted_result
+        selected_diag = feasibility.adapted
     if not adaptive_bridge_search:
         feasibility = FeasibilitySearchDiagnostics(
             initial=feasibility.initial,
@@ -1261,6 +1519,43 @@ def run_demo_case(
             adapted=None,
             adaptation_strategy="search disabled",
         )
+    else:
+        extra_strategies: list[str] = []
+        if randomize_bridge_times and selected_diag.passes:
+            randomized = randomize_bridge_times_result(
+                rng,
+                result,
+                max_lateral_accel_mps2=max_lateral_accel_mps2,
+                max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+                max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+                extra_time_range_s=bridge_time_extra_range_s,
+            )
+            if randomized is not None:
+                result, selected_diag = randomized
+                extra_strategies.append("randomize M/N")
+        if past_bump and selected_diag.passes:
+            bumped = apply_random_past_history_bump(
+                rng,
+                result,
+                max_lateral_accel_mps2=max_lateral_accel_mps2,
+                max_bridge_speed_gap_mps=max_bridge_speed_gap_mps,
+                max_bridge_jerk_mps3=max_bridge_jerk_mps3,
+            )
+            if bumped is not None:
+                result, selected_diag = bumped
+                extra_strategies.append("past bump")
+        if extra_strategies:
+            strategy_parts = (
+                [feasibility.adaptation_strategy]
+                if feasibility.adaptation_strategy is not None
+                else []
+            )
+            feasibility = FeasibilitySearchDiagnostics(
+                initial=feasibility.initial,
+                adapted_result=result,
+                adapted=selected_diag,
+                adaptation_strategy=" + ".join(strategy_parts + extra_strategies),
+            )
     return DemoArtifacts(
         seed_result=initial_result,
         selected_result=result,
@@ -1268,4 +1563,5 @@ def run_demo_case(
         initial_recover_time_s=initial_recover_time_s,
         initial_past_connect_time_s=initial_past_connect_time_s,
         adaptive_bridge_search=adaptive_bridge_search,
+        requested_past_bump=past_bump,
     )
